@@ -25,6 +25,13 @@ type Authorship = {
 
 // ---- Ноды: то, что стоит на холсте ----
 
+/**
+ * Пометка «засчитано»: нода уже была выполнена, потом в ней появилось невыполненное, а участник
+ * выбрал «не блокировать последующие». Для всего после неё нода считается выполненной. Снимается
+ * сама, когда нода снова выполнена по-настоящему, или вручную (тогда последующее блокируется).
+ */
+export type CountedDone = { readonly by: UserId; readonly at: string };
+
 type BaseNode = Authorship & {
   readonly id: NodeId;
   /** null — корневой уровень; иначе id ноды типа 'roadmap'. */
@@ -34,6 +41,7 @@ type BaseNode = Authorship & {
   /** Целые пиксели в координатах холста. */
   readonly x: number;
   readonly y: number;
+  readonly countedDone: CountedDone | null;
 };
 
 /** Блок: карточка с шапкой, описанием и списком задач. */
@@ -60,8 +68,14 @@ export type GraphNode = BlockNode | RoadmapNode | MilestoneNode;
 
 // ---- Задачи: пункты внутри блока ----
 
-/** Предупреждение «предыдущая задача изменена»: sourceTaskId — задача, которая перестала быть выполненной. */
-export type TaskWarning = { readonly sourceTaskId: TaskId; readonly at: string };
+/**
+ * Откуда предупреждение: переоткрытая задача или нода, которая перестала быть выполненной
+ * (в неё добавили задачу, провели стрелку от невыполненного, сняли «засчитано» и т. п.).
+ */
+export type WarningSource = EdgeSource;
+
+/** Предупреждение «предыдущее снова не выполнено». Одно на источник: повтор обновляет время. */
+export type TaskWarning = { readonly source: WarningSource; readonly at: string };
 
 export type Task = Authorship & {
   readonly id: TaskId;
@@ -120,14 +134,16 @@ export type NodePatch = {
   readonly description?: string;
   readonly deadline?: Deadline | null;
   readonly labelIds?: readonly LabelId[];
+  /** Только снять пометку «засчитано». Ставится она лишь выбором «не блокировать» (Op.keepDone). */
+  readonly countedDone?: null;
 };
 export type NodePatchField = keyof NodePatch;
 
 /** Какие поля можно менять у какого типа ноды. */
 export const EDITABLE_NODE_FIELDS = {
-  block: ['title', 'description', 'deadline', 'labelIds'],
-  roadmap: ['title', 'description', 'deadline', 'labelIds'],
-  milestone: ['title', 'description', 'deadline'],
+  block: ['title', 'description', 'deadline', 'labelIds', 'countedDone'],
+  roadmap: ['title', 'description', 'deadline', 'labelIds', 'countedDone'],
+  milestone: ['title', 'description', 'deadline', 'countedDone'],
 } as const satisfies {
   readonly [T in NodeType]: readonly (NodePatchField & keyof Extract<GraphNode, { type: T }>)[];
 };
@@ -148,6 +164,8 @@ export const LIMITS = {
   maxLabels: 20,
   titleMaxLength: 200,
   descriptionMaxLength: 20_000,
+  /** Дробный индекс растёт медленно; лимит защищает от мусорных строк, а не от обычной работы. */
+  orderMaxLength: 128,
 } as const;
 
 // ---- Операции ----
@@ -155,8 +173,8 @@ export const LIMITS = {
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 type AuthorshipField = keyof Authorship;
 
-/** Нода в операции создания: без авторства — его проставляет graph-core. */
-export type NewNode = DistributiveOmit<GraphNode, AuthorshipField>;
+/** Нода в операции создания: без авторства (его проставляет graph-core) и без «засчитано». */
+export type NewNode = DistributiveOmit<GraphNode, AuthorshipField | 'countedDone'>;
 
 /** Задача в операции создания: без номера (его выдаёт сервер), предупреждений и авторства. */
 export type NewTask = Omit<Task, AuthorshipField | 'number' | 'warnings'>;
@@ -164,7 +182,20 @@ export type NewTask = Omit<Task, AuthorshipField | 'number' | 'warnings'>;
 export type NodeMove = { readonly id: NodeId; readonly x: number; readonly y: number };
 
 /** Атомарное изменение графа. Все изменения графа — только операциями. */
-export type Op =
+export type Op = OpBody & OpOptions;
+
+/** Общее для всех операций. */
+export type OpOptions = {
+  /**
+   * Выбор «не блокировать последующие». Если операция делает выполненную ноду невыполненной
+   * (новая задача в выполненном блоке, новая стрелка от невыполненного и т. п.), нода получает
+   * пометку «засчитано» и для всего после неё остаётся выполненной; предупреждений нет.
+   * Без флага последующее блокируется, а начатые задачи там получают предупреждение.
+   */
+  readonly keepDone?: boolean;
+};
+
+type OpBody =
   | { readonly kind: 'createNode'; readonly node: NewNode }
   | { readonly kind: 'updateNode'; readonly id: NodeId; readonly patch: NodePatch }
   /** И перетаскивание, и автораскладка. Позиции никогда не конфликтуют. */

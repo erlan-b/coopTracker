@@ -6,13 +6,19 @@ import type { Graph, MilestoneNode, NewNode, NewTask, RoadmapNode, Task } from '
 import { EDITABLE_NODE_FIELDS } from './types';
 
 describe('ноды', () => {
-  it('у блока и роадмапы — название, описание, срок и метки', () => {
-    expect(EDITABLE_NODE_FIELDS.block).toEqual(['title', 'description', 'deadline', 'labelIds']);
-    expect(EDITABLE_NODE_FIELDS.roadmap).toEqual(['title', 'description', 'deadline', 'labelIds']);
+  it('у блока и роадмапы — название, описание, срок, метки и «засчитано»', () => {
+    const fields = ['title', 'description', 'deadline', 'labelIds', 'countedDone'];
+    expect(EDITABLE_NODE_FIELDS.block).toEqual(fields);
+    expect(EDITABLE_NODE_FIELDS.roadmap).toEqual(fields);
   });
 
-  it('у milestone — название, описание и срок', () => {
-    expect(EDITABLE_NODE_FIELDS.milestone).toEqual(['title', 'description', 'deadline']);
+  it('у milestone — название, описание, срок и «засчитано»', () => {
+    expect(EDITABLE_NODE_FIELDS.milestone).toEqual([
+      'title',
+      'description',
+      'deadline',
+      'countedDone',
+    ]);
   });
 
   it('статуса и ответственных у нод нет — они только у задач', () => {
@@ -22,8 +28,9 @@ describe('ноды', () => {
     expectTypeOf<Task>().toHaveProperty('assigneeIds');
   });
 
-  it('новая нода не задаёт авторство', () => {
+  it('новая нода не задаёт авторство и «засчитано»', () => {
     expectTypeOf<NewNode>().not.toHaveProperty('createdBy');
+    expectTypeOf<NewNode>().not.toHaveProperty('countedDone');
   });
 });
 
