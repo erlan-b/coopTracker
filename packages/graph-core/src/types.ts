@@ -228,7 +228,7 @@ type OpBody =
       readonly scope: 'this' | 'downstream';
     }
   /**
-   * Возвращает удалённое как было: с теми же id и номерами (undo удаления, корзина).
+   * Возвращает удалённое как было: с теми же id и номерами (корзина).
    * Сервер принимает только то, что совпадает с его копией в корзине.
    */
   | {
@@ -236,8 +236,32 @@ type OpBody =
       readonly nodes: readonly GraphNode[];
       readonly tasks: readonly Task[];
       readonly edges: readonly GraphEdge[];
-    };
+    }
+  /**
+   * Отмена своего действия: записи из changes возвращаются к состоянию «до», кроме того, что с
+   * тех пор изменили другие (revert.ts). Сервер принимает её, только если changes совпадают с
+   * записью его лога о действии этого же участника в этой же ветке.
+   */
+  | { readonly kind: 'revert'; readonly changes: Changes };
 export type OpKind = Op['kind'];
+
+// ---- Изменения ----
+
+/** Запись до и после изменения. null — записи не было или не стало. */
+export type RecordChange<T> = { readonly before: T | null; readonly after: T | null };
+
+/**
+ * Что изменила операция или действие из нескольких операций: каждая затронутая запись до и
+ * после, включая каскад и последствия (предупреждения, «засчитано»). Из этого строится отмена,
+ * а позже — история изменений и слияние веток.
+ */
+export type Changes = {
+  /** Когда было действие. При отмене предупреждения получат только задачи, изменённые позже. */
+  readonly at: string;
+  readonly nodes: readonly RecordChange<GraphNode>[];
+  readonly tasks: readonly RecordChange<Task>[];
+  readonly edges: readonly RecordChange<GraphEdge>[];
+};
 
 // ---- Контекст ----
 

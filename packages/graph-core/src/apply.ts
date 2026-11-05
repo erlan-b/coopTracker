@@ -1,36 +1,33 @@
 // Применение операции к графу: сначала права и инварианты (DESIGN.md, «Инварианты»),
-// потом новый граф и последствия: предупреждения и пометки «засчитано». Входной граф не
-// меняется. Ноды, задачи и стрелки, которых операция не коснулась, переходят в новый граф
-// теми же объектами; если операция ничего не меняет, возвращается тот же граф.
+// потом новый граф и последствия: предупреждения и пометки «засчитано» (consequences.ts).
+// Входной граф не меняется. Ноды, задачи и стрелки, которых операция не коснулась, переходят
+// в новый граф теми же объектами; если операция ничего не меняет, возвращается тот же граф.
 
-import { doneness } from './doneness';
-import type { Doneness } from './doneness';
+import { relockOf, settle, sourceKey } from './consequences';
+import type { Relock } from './consequences';
 import type { GraphError, Result } from './errors';
 import type { EdgeId, NodeId, TaskId } from './ids';
+import { checkBlock, checkEdge, checkPlacement, cycleError } from './invariants';
 import { getOwn, putAll, removeAll, valuesOf } from './records';
-import { checkStatusChange, isTaskCompleted, WARNED_STATUSES } from './status';
-import { downstreamTasks, findCycle, spreadLoss, taskEdgeTargets } from './structure';
-import type { SpreadStart } from './structure';
+import { planRevert, revertCandidate } from './revert';
+import { checkStatusChange } from './status';
+import { downstreamTasks, findCycle } from './structure';
 import { EDITABLE_NODE_FIELDS } from './types';
 import type {
   ApplyContext,
   BlockNode,
-  EdgeSource,
   Graph,
   GraphEdge,
   GraphNode,
-  GraphSettings,
   NewNode,
   NewTask,
   NodeMove,
   NodePatch,
   NodePatchField,
-  NodeType,
   Op,
   RoadmapNode,
   Task,
   TaskPatch,
-  WarningSource,
 } from './types';
 import {
   checkCoordinates,
@@ -39,43 +36,44 @@ import {
   checkTaskFields,
   invalidValue,
 } from './validate';
+import { sameValue } from './values';
+
+export type { Relock } from './consequences';
 
 export function applyOp(graph: Graph, op: Op, ctx: ApplyContext): Result<Graph> {
+  if (op.kind === 'revert') {
+    const reverted = planRevert(graph, op.changes, ctx);
+    return reverted.ok ? ok(reverted.value.graph) : reverted;
+  }
   const changed = applyChange(graph, op, ctx);
   if (!changed.ok || changed.value === graph || !mayChangeDoneness(op)) return changed;
-  return ok(settle(graph, changed.value, op, ctx));
+  return ok(
+    settle(graph, changed.value, ctx, {
+      keepDone: op.keepDone === true,
+      warnOnlyChangedAfter: null,
+    }),
+  );
 }
-
-/** Что операция снова заблокирует — для диалога «блокировать / не блокировать / отмена». */
-export type Relock = {
-  /** Выполненные ноды, которые перестанут быть выполненными; при «не блокировать» получат «засчитано». */
-  readonly nodes: readonly NodeId[];
-  /** Задачи, которые окажутся заблокированы. Начатые и выполненные получат предупреждение. */
-  readonly tasks: readonly TaskId[];
-};
 
 /**
  * Проверяет операцию и говорит, что она снова заблокирует, ничего не меняя. Пустой результат —
  * спрашивать не о чем. Ошибки — те же, что у applyOp.
  */
 export function previewRelock(graph: Graph, op: Op, ctx: ApplyContext): Result<Relock> {
-  const changed = applyChange(graph, op, ctx);
-  if (!changed.ok) return changed;
-  const after = changed.value;
-  if (after === graph || !mayChangeDoneness(op))
-    return { ok: true, value: { nodes: [], tasks: [] } };
-  const was = doneness(graph, ctx.settings);
-  const reached = lossSpread(graph, after, op, ctx.settings, was, doneness(after, ctx.settings));
-  return {
-    ok: true,
-    value: {
-      nodes: doneness(after, ctx.settings, was.done).toCount,
-      tasks: [...reached.keys()],
-    },
-  };
+  const nothing: Result<Relock> = { ok: true, value: { nodes: [], tasks: [] } };
+  let after: Graph;
+  if (op.kind === 'revert') {
+    const candidate = revertCandidate(graph, op.changes, ctx);
+    if (!candidate.ok) return candidate;
+    after = candidate.value.graph;
+  } else {
+    const changed = applyChange(graph, op, ctx);
+    if (!changed.ok) return changed;
+    if (!mayChangeDoneness(op)) return nothing;
+    after = changed.value;
+  }
+  return after === graph ? nothing : { ok: true, value: relockOf(graph, after, ctx.settings) };
 }
-
-// ---- Последствия: предупреждения и «засчитано» ----
 
 /** Перемещение, снятие предупреждений и правка текста выполненность нод не меняют. */
 function mayChangeDoneness(op: Op): boolean {
@@ -92,90 +90,13 @@ function mayChangeDoneness(op: Op): boolean {
   }
 }
 
-function sourceKey(source: WarningSource): string {
-  return source.kind === 'node' ? `node:${source.nodeId}` : `task:${source.taskId}`;
-}
-
-function withWarning(task: Task, source: WarningSource, at: string): Task {
-  const key = sourceKey(source);
-  const others = task.warnings.filter((warning) => sourceKey(warning.source) !== key);
-  return { ...task, warnings: [...others, { source, at }] };
-}
-
-/** Задача, которую эта операция вывела из выполненного состояния. */
-function reopenedTask(before: Graph, after: Graph, op: Op, settings: GraphSettings): TaskId | null {
-  if (op.kind !== 'updateTask') return null;
-  const was = getOwn(before.tasks, op.id);
-  const now = getOwn(after.tasks, op.id);
-  return was &&
-    now &&
-    isTaskCompleted(was.status, settings) &&
-    !isTaskCompleted(now.status, settings)
-    ? op.id
-    : null;
-}
-
-/**
- * Кого затрагивает операция и от какого источника. Переоткрытая задача — источник для всего:
- * и по её собственным стрелкам, и по нодам, которые из-за неё перестали быть выполненными.
- * Иначе источник — первая в цепочке нода, которая перестала быть выполненной.
- */
-function lossSpread(
-  before: Graph,
-  after: Graph,
-  op: Op,
-  settings: GraphSettings,
-  was: Doneness,
-  now: Doneness,
-): Map<TaskId, WarningSource> {
-  const lost = now.order.filter((id) => was.done.has(id) && !now.done.has(id));
-  const reopened = reopenedTask(before, after, op, settings);
-  const starts: SpreadStart<WarningSource>[] = reopened
-    ? [
-        {
-          tag: { kind: 'task', taskId: reopened },
-          locked: taskEdgeTargets(after, reopened),
-          notDone: lost,
-        },
-      ]
-    : lost.map((id) => ({ tag: { kind: 'node', nodeId: id }, locked: [], notDone: [id] }));
-  const reached = spreadLoss(after, starts);
-  if (reopened) reached.delete(reopened);
-  return reached;
-}
-
-/**
- * После изменения: с «не блокировать» нодам, которые перестали быть выполненными, ставится
- * «засчитано»; пометка снимается там, где нода снова выполнена по-настоящему; начатые и
- * выполненные задачи, которые оказались заблокированы, получают предупреждение.
- */
-function settle(before: Graph, after: Graph, op: Op, ctx: ApplyContext): Graph {
-  const was = doneness(before, ctx.settings);
-  const now = doneness(after, ctx.settings, op.keepDone === true ? was.done : undefined);
-
-  const marked: GraphNode[] = [];
-  for (const id of now.toCount) {
-    const node = getOwn(after.nodes, id);
-    if (node) marked.push({ ...node, countedDone: { by: ctx.actor.id, at: ctx.now } });
-  }
-  for (const id of now.countedNoLongerNeeded) {
-    const node = getOwn(after.nodes, id);
-    if (node) marked.push({ ...node, countedDone: null });
-  }
-
-  const warned: Task[] = [];
-  for (const [taskId, source] of lossSpread(before, after, op, ctx.settings, was, now)) {
-    const task = getOwn(after.tasks, taskId);
-    if (task && WARNED_STATUSES.has(task.status)) warned.push(withWarning(task, source, ctx.now));
-  }
-
-  if (marked.length === 0 && warned.length === 0) return after;
-  return { ...after, nodes: putAll(after.nodes, marked), tasks: putAll(after.tasks, warned) };
-}
-
 // ---- Само изменение ----
 
-function applyChange(graph: Graph, op: Op, ctx: ApplyContext): Result<Graph> {
+function applyChange(
+  graph: Graph,
+  op: Exclude<Op, { kind: 'revert' }>,
+  ctx: ApplyContext,
+): Result<Graph> {
   if (ctx.actor.role === 'viewer') return fail({ code: 'FORBIDDEN', reason: 'viewer' });
   switch (op.kind) {
     case 'createNode':
@@ -246,29 +167,6 @@ const authorship = (ctx: ApplyContext) => ({
 /** Отметка «кто и когда менял». Ставится при изменении содержимого, но не при перемещении. */
 const edited = (ctx: ApplyContext) => ({ updatedBy: ctx.actor.id, updatedAt: ctx.now });
 
-/** Сравнение значений полей: строки, числа, null, списки и сроки. */
-function sameValue(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
-  if (Array.isArray(a) || Array.isArray(b)) {
-    return (
-      Array.isArray(a) &&
-      Array.isArray(b) &&
-      a.length === b.length &&
-      a.every((item, i) => sameValue(item, b[i]))
-    );
-  }
-  const keys = Object.keys(a);
-  return (
-    keys.length === Object.keys(b).length &&
-    keys.every(
-      (key) =>
-        Object.hasOwn(b, key) &&
-        sameValue((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]),
-    )
-  );
-}
-
 /** Поля изменения, которые действительно отличаются от текущих; null — менять нечего. */
 function changedFields<P extends object>(
   current: object,
@@ -285,60 +183,6 @@ function changedFields<P extends object>(
     changes = { ...changes, [field]: value } as Partial<P>;
   }
   return changes;
-}
-
-/** parentId ведёт к роадмапе, а роадмапа стоит только на корневом уровне. */
-function checkPlacement(
-  nodes: Graph['nodes'],
-  node: { readonly id: NodeId; readonly type: NodeType; readonly parentId: NodeId | null },
-): GraphError | null {
-  if (node.parentId === null) return null;
-  if (node.type === 'roadmap') return { code: 'NESTING_TOO_DEEP', id: node.id };
-  return getOwn(nodes, node.parentId)?.type === 'roadmap'
-    ? null
-    : { code: 'INVALID_PARENT', parentId: node.parentId };
-}
-
-/** Задачи лежат только в блоках. */
-function checkBlock(graph: Graph, id: NodeId): GraphError | null {
-  const node = getOwn(graph.nodes, id);
-  if (!node) return { code: 'NODE_NOT_FOUND', id };
-  return node.type === 'block' ? null : { code: 'WRONG_NODE_TYPE', id, expected: 'block' };
-}
-
-function sameSource(a: EdgeSource, b: EdgeSource): boolean {
-  return a.kind === 'node'
-    ? b.kind === 'node' && a.nodeId === b.nodeId
-    : b.kind === 'task' && a.taskId === b.taskId;
-}
-
-/** Концы стрелки существуют, это не петля и такой стрелки ещё нет. Циклы — отдельно. */
-function checkEdge(graph: Graph, edge: GraphEdge): GraphError | null {
-  const { source, target } = edge;
-  let fromNodeId: NodeId;
-  if (source.kind === 'node') {
-    if (!Object.hasOwn(graph.nodes, source.nodeId)) {
-      return { code: 'NODE_NOT_FOUND', id: source.nodeId };
-    }
-    fromNodeId = source.nodeId;
-  } else {
-    const task = getOwn(graph.tasks, source.taskId);
-    if (!task) return { code: 'TASK_NOT_FOUND', id: source.taskId };
-    fromNodeId = task.blockId;
-  }
-  if (!Object.hasOwn(graph.nodes, target.nodeId)) {
-    return { code: 'NODE_NOT_FOUND', id: target.nodeId };
-  }
-  if (fromNodeId === target.nodeId) return { code: 'SELF_LOOP', edgeId: edge.id };
-  const twin = valuesOf(graph.edges).find(
-    (other) => sameSource(other.source, source) && other.target.nodeId === target.nodeId,
-  );
-  return twin ? { code: 'DUPLICATE_EDGE', edgeId: twin.id } : null;
-}
-
-function cycleError(graph: Graph): GraphError | null {
-  const path = findCycle(graph);
-  return path ? { code: 'CYCLE', path } : null;
 }
 
 // ---- Ноды ----

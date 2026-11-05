@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   E,
   N,
+  NOW,
   T,
   apply,
   applyOk,
@@ -38,6 +39,7 @@ describe('viewer', () => {
     deleteEdge: { kind: 'deleteEdge', id: E('ab') },
     dismissWarnings: { kind: 'dismissWarnings', taskId: T('t'), scope: 'this' },
     restore: { kind: 'restore', nodes: [], tasks: [], edges: [] },
+    revert: { kind: 'revert', changes: { at: NOW, nodes: [], tasks: [], edges: [] } },
   };
 
   it.each(Object.values(samples))('не может $kind → FORBIDDEN', (op) => {
