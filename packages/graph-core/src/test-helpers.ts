@@ -125,7 +125,7 @@ function referenceDiff<V>(
   return result;
 }
 
-function referenceChanges(before: Graph, after: Graph, at: string): Changes {
+export function referenceChanges(before: Graph, after: Graph, at: string): Changes {
   return {
     at,
     nodes: referenceDiff(before.nodes, after.nodes),
