@@ -87,21 +87,18 @@ export function applyOps(graph: Graph, ops: readonly Op[], ctx: ApplyContext): R
   }
   const draft = new GraphDraft(graph);
   const skipped: RevertSkip[] = [];
-  const stepwise = ops.some((op) => op.kind === 'revert');
-  for (const op of ops) {
-    const problem = applyToDraft(draft, op, ctx, skipped) ?? checkLimits(draft);
+  if (ops.some((op) => op.kind === 'revert')) {
+    for (const op of ops) {
+      const problem = applyWithoutConsequences(draft, [op], ctx, skipped);
+      if (problem) return { ok: false, error: problem };
+      settle(draft, ctx, {
+        keepDone: op.keepDone === true,
+        warnOnlyChangedAfter: op.kind === 'revert' ? op.changes.at : null,
+      });
+    }
+  } else {
+    const problem = applyWithoutConsequences(draft, ops, ctx, skipped);
     if (problem) return { ok: false, error: problem };
-    if (!stepwise) continue;
-    const cycle = cycleError(draft);
-    if (cycle) return { ok: false, error: cycle };
-    settle(draft, ctx, {
-      keepDone: op.keepDone === true,
-      warnOnlyChangedAfter: op.kind === 'revert' ? op.changes.at : null,
-    });
-  }
-  if (!stepwise) {
-    const cycle = cycleError(draft);
-    if (cycle) return { ok: false, error: cycle };
     settle(draft, ctx, {
       keepDone: ops.some((op) => op.keepDone === true),
       warnOnlyChangedAfter: null,
@@ -117,9 +114,27 @@ export function applyOps(graph: Graph, ops: readonly Op[], ctx: ApplyContext): R
  */
 export function previewRelock(graph: Graph, op: Op, ctx: ApplyContext): Result<Relock> {
   const draft = new GraphDraft(graph);
-  const problem = applyToDraft(draft, op, ctx, []) ?? checkLimits(draft) ?? cycleError(draft);
+  const problem = applyWithoutConsequences(draft, [op], ctx, []);
   if (problem) return { ok: false, error: problem };
   return { ok: true, value: relockOf(draft, ctx.settings) };
+}
+
+/**
+ * Операции без последствий (предупреждений и пометок «засчитано»): права, инварианты, лимиты,
+ * в конце — проверка циклов. Внутри пакета цикл может временно появиться и исчезнуть.
+ * Экспортируется для эталона в тестах: он считает последствия заново по этому графу.
+ */
+export function applyWithoutConsequences(
+  draft: GraphDraft,
+  ops: readonly Op[],
+  ctx: ApplyContext,
+  skipped: RevertSkip[],
+): GraphError | null {
+  for (const op of ops) {
+    const problem = applyToDraft(draft, op, ctx, skipped) ?? checkLimits(draft);
+    if (problem) return problem;
+  }
+  return cycleError(draft);
 }
 
 function applyToDraft(
