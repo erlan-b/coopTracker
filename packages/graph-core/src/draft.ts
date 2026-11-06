@@ -33,11 +33,19 @@ export type GraphIndex = {
   readonly counted: ReadonlySet<NodeId>;
 };
 
+/**
+ * Откуда взялся граф: из какого графа и что в нём изменилось. По этому интерфейсные состояния
+ * пересчитывают только задетое (states.ts). Ссылка на прежний граф слабая: история не держится
+ * в памяти, а если прежний граф уже собран сборщиком мусора — состояния считаются с нуля.
+ */
+export type Lineage = { readonly parent: WeakRef<Graph>; readonly touched: Step };
+
 /** Посчитанное для графа: указатели, порядок зависимостей, выполненность (по настройкам envi). */
 type Derived = {
   readonly index: GraphIndex;
   order: DependencyOrder | undefined;
   doneness: ReadonlyMap<string, DonenessState>;
+  readonly lineage?: Lineage;
 };
 
 const derivedCache = new WeakMap<Graph, Derived>();
@@ -503,6 +511,7 @@ export class GraphDraft {
       },
       order: this.order,
       doneness,
+      lineage: { parent: new WeakRef(base), touched: this.touched() },
     });
     return graph;
   }
@@ -510,6 +519,11 @@ export class GraphDraft {
 
 /** Граф для чтения и обходов: рабочая копия без записей. */
 export const viewOf = (graph: Graph): GraphDraft => new GraphDraft(graph);
+
+/** Откуда взялся граф, если его сделала рабочая копия. */
+export function lineageOf(graph: Graph): Lineage | undefined {
+  return derivedCache.get(graph)?.lineage;
+}
 
 /** Запомненное для графа (для проверок в тестах). */
 export function cachedDerived(graph: Graph): Readonly<Derived> | undefined {

@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest';
 import { applyOp, applyOps, previewRelock } from './apply';
 import type { Result } from './errors';
 import { graphFromSnapshot, toSnapshot } from './snapshot';
+import { graphStates, statesFromScratch } from './states';
+import type { Now } from './states';
 import {
   N,
   T,
@@ -43,6 +45,7 @@ function random(seed: number): () => number {
 }
 
 const context = ctx('master', { statusMode: 'review', reviewUnlocks: false });
+const NOW: Now = { at: '2026-11-15T12:00:00.000Z', today: '2026-11-15' };
 
 function ok<V>(result: Result<V>): V {
   if (!result.ok) throw new Error(`отклонено: ${JSON.stringify(result.error)}`);
@@ -170,6 +173,22 @@ describe('скорость на 1 000 нод и 10 000 задач', () => {
       return [...nodes, ...next, ...skip];
     };
     expect(median((i) => ok(applyOps(graph, ops(i), context)))).toBeLessThan(HEAVY_MS);
+  });
+
+  it(`состояния для интерфейса после смены статуса — до ${FREQUENT_MS} мс`, () => {
+    // Как в интерфейсе: прошлые состояния есть, после операции считается только задетое.
+    const before = graphStates(graph, context.settings, NOW);
+    const after = ok(applyOp(graph, reopen, context)).graph;
+    expect(median(() => graphStates(after, context.settings, NOW, before))).toBeLessThan(
+      FREQUENT_MS,
+    );
+  });
+
+  it(`состояния для интерфейса с нуля — до ${HEAVY_MS} мс`, () => {
+    // Первый показ и смена минуты (просрочка); дальше — только задетое.
+    expect(
+      median((i) => statesFromScratch(graph, context.settings, { ...NOW, at: `${NOW.at}#${i}` })),
+    ).toBeLessThan(HEAVY_MS);
   });
 
   it(`загрузка снимка и первая операция — до ${LOAD_MS} мс`, () => {

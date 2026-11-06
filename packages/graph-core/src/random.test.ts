@@ -5,6 +5,7 @@
 import fc from 'fast-check';
 import type { Arbitrary } from 'fast-check';
 import { describe, expect, it } from 'vitest';
+import { asUserId } from './ids';
 import {
   E,
   N,
@@ -19,7 +20,9 @@ import {
   task,
   taskEdge,
 } from './test-helpers';
-import type { Graph, Op, TaskStatus } from './types';
+import { graphStates, statesFromScratch } from './states';
+import type { GraphStates, Now } from './states';
+import type { Deadline, Graph, Op, TaskStatus } from './types';
 
 /**
  * r1 (i1: t4 ✓ → i2: t5) → m;  a (t1 ✓, t2) → b (t3 в работе);  t3 → c (t6 ✓);  пустая r2.
@@ -125,8 +128,32 @@ const op: Arbitrary<Op> = fc.oneof(
   },
 );
 
+/** Сроки, оценки и ответственные — для просрочки и сводок. */
+const deadline = fc.constantFrom<Deadline | null>(
+  null,
+  { kind: 'date', date: '2026-11-15' },
+  { kind: 'datetime', at: '2026-11-15T12:00:00.000Z' },
+);
+const details: Arbitrary<Op> = fc.oneof(
+  fc
+    .tuple(taskId, deadline, fc.option(fc.constantFrom(1, 2.5), { nil: null }))
+    .map(([id, due, estimate]): Op => ({
+      kind: 'updateTask',
+      id: T(id),
+      patch: { deadline: due, estimate },
+    })),
+  fc.tuple(taskId, fc.subarray(['u1', 'u2', 'u3'])).map(([id, users]): Op => ({
+    kind: 'updateTask',
+    id: T(id),
+    patch: { assigneeIds: users.map(asUserId) },
+  })),
+  fc
+    .tuple(fc.constantFrom('a', 'b', 'm', 'r1', 'i1'), deadline)
+    .map(([id, due]): Op => ({ kind: 'updateNode', id: N(id), patch: { deadline: due } })),
+);
+
 const withKeepDone: Arbitrary<Op> = fc
-  .tuple(op, fc.boolean())
+  .tuple(fc.oneof({ weight: 5, arbitrary: op }, { weight: 1, arbitrary: details }), fc.boolean())
   .map(([body, keepDone]) => (keepDone ? { ...body, keepDone } : body));
 
 describe('случайные последовательности операций', () => {
@@ -144,6 +171,49 @@ describe('случайные последовательности операци
           graph = after;
         }
       }),
+      { numRuns: 200 },
+    );
+  });
+
+  it('состояния для интерфейса: пересчёт задетого совпадает с подсчётом с нуля', () => {
+    const moments: readonly Now[] = [
+      { at: '2026-11-15T12:00:00.000Z', today: '2026-11-15' },
+      { at: '2026-11-16T09:00:00.000Z', today: '2026-11-16' },
+    ];
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    fc.assert(
+      fc.property(
+        fc.array(fc.tuple(withKeepDone, fc.boolean(), fc.constantFrom(0, 0, 0, 1)), {
+          maxLength: 30,
+        }),
+        fc.boolean(),
+        (steps, unlocks) => {
+          const context = ctx('master', { statusMode: 'review', reviewUnlocks: unlocks });
+          let graph: Graph = start;
+          let now = moments[0]!;
+          let states: GraphStates = graphStates(graph, context.settings, now);
+          for (const [next, look, moment] of steps) {
+            const result = applyFull(graph, next, context);
+            if (result.ok) graph = result.value.graph;
+            // Иногда состояния не считаются: тогда пересчёт охватывает несколько операций.
+            if (!look) continue;
+            now = moments[moment]!;
+            const updated = graphStates(graph, context.settings, now, states);
+            expect(updated).toEqual(statesFromScratch(graph, context.settings, now));
+            // Состояние с тем же значением — тот же объект, что и раньше.
+            for (const [records, before] of [
+              [updated.tasks, states.tasks],
+              [updated.nodes, states.nodes],
+            ] as const) {
+              for (const [id, view] of records as ReadonlyMap<string, unknown>) {
+                const old = (before as ReadonlyMap<string, unknown>).get(id);
+                if (old !== undefined && same(old, view)) expect(view).toBe(old);
+              }
+            }
+            states = updated;
+          }
+        },
+      ),
       { numRuns: 200 },
     );
   });
