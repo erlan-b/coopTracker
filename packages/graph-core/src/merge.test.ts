@@ -3,23 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { asLabelId, asUserId } from './ids';
-import { checkGraph } from './invariants';
-import { merge } from './merge';
 import type { MergeOptions, MergeSide, Merged } from './merge';
-import {
-  E,
-  N,
-  T,
-  applyOpsOk,
-  block,
-  build,
-  deepFreeze,
-  edge,
-  expectDerivedConsistent,
-  must,
-  referenceChanges,
-  task,
-} from './test-helpers';
+import { E, N, T, applyOpsOk, block, build, edge, mergeChecked, must, task } from './test-helpers';
 import type { ApplyContext, Graph, GraphNode, NodePatch, Op, Task, TaskPatch } from './types';
 
 const T1 = '2026-11-07T10:00:00.000Z';
@@ -70,21 +55,8 @@ const users = (...names: string[]) => names.map(asUserId);
 const taskOf = (graph: Graph, id: string): Task => must(graph.tasks.get(T(id)));
 const nodeOf = (graph: Graph, id: string): GraphNode => must(graph.nodes.get(N(id)));
 
-/**
- * Слияние с замороженными графами. Проверяет: результат корректен целиком, изменения совпадают
- * с полным сравнением целевого графа и результата (неизменённое — те же объекты), запомненное
- * для результата совпадает с посчитанным заново.
- */
-function mergeOk(base: Graph, branch: Graph, target: Graph, options: MergeOptions = {}): Merged {
-  for (const graph of [base, branch, target]) deepFreeze(graph);
-  const result = merge(base, branch, target, as('merger', T3), options);
-  if (!result.ok) throw new Error(`слияние отклонено: ${JSON.stringify(result.error)}`);
-  const { graph, changes } = result.value;
-  expect(checkGraph(graph)).toBeNull();
-  expect(changes).toEqual(referenceChanges(target, graph, T3));
-  expectDerivedConsistent(graph);
-  return result.value;
-}
+const mergeOk = (base: Graph, branch: Graph, target: Graph, options: MergeOptions = {}): Merged =>
+  mergeChecked(base, branch, target, as('merger', T3), options);
 
 const choose = (key: string, side: MergeSide): MergeOptions => ({
   resolutions: new Map([[key, side]]),
@@ -218,9 +190,9 @@ describe('merge: конфликты полей', () => {
     const b = onBranch(updateTask('t3', { status: 'todo' }));
     const t = onTarget(updateTask('t3', { status: 'done' }));
     const { graph, conflicts } = mergeOk(BASE, b, t);
-    expect(
-      conflicts.map(({ field, branch: ours, target: theirs }) => [field, ours, theirs]),
-    ).toEqual([['status', 'todo', 'done']]);
+    expect(conflicts).toEqual([
+      expect.objectContaining({ field: 'status', branch: 'todo', target: 'done' }),
+    ]);
     expect(taskOf(graph, 't3').status).toBe('done');
   });
 

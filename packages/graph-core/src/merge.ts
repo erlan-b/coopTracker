@@ -3,43 +3,81 @@
 // Результат строится поверх целевого графа: всё, что слияние не трогает, остаётся теми же
 // объектами, а изменения от целевого графа к результату получаются без сравнения всего графа.
 
+import { checkLimits } from './apply';
 import { changesOfDraft } from './changes';
 import { sourceKey } from './consequences';
-import { GraphDraft } from './draft';
+import { GraphDraft, viewOf } from './draft';
 import type { Result } from './errors';
-import type { NodeId, TaskId } from './ids';
-import { checkStep } from './invariants';
+import type { EdgeId, NodeId, TaskId } from './ids';
+import { checkEdge, checkStep } from './invariants';
 import { LIMITS } from './types';
-import type { ApplyContext, Changes, Graph, GraphNode, Task, TaskWarning } from './types';
+import type {
+  ApplyContext,
+  Changes,
+  Graph,
+  GraphEdge,
+  GraphNode,
+  NodeType,
+  Task,
+  TaskWarning,
+} from './types';
 import { ownField, sameValue } from './values';
 
 /** Чья сторона: ветка, которую вливаем, или целевая ветка. */
 export type MergeSide = 'branch' | 'target';
 
-type ConflictValues = {
+type Decision = {
   /**
    * Ключ конфликта: по нему передаётся решение. При пересчёте слияния на новой версии целевой
    * ветки у того же конфликта тот же ключ.
    */
   readonly key: string;
-  /** Значение в базе; undefined — записи в базе не было (её добавили с обеих сторон). */
-  readonly base: unknown;
-  readonly branch: unknown;
-  readonly target: unknown;
-  /** Решение; null — конфликт не решён, и в результате значение целевой ветки. */
+  /** Решение: как в ветке или как в целевой; null — не решён, и в результате как в целевой. */
   readonly chosen: MergeSide | null;
 };
+
+type RecordRef =
+  | { readonly record: 'node'; readonly id: NodeId }
+  | { readonly record: 'task'; readonly id: TaskId };
 
 /**
  * Конфликт поля: оно изменено с обеих сторон по-разному. Для места задачи поле — blockId, а
  * решение переносит блок вместе с порядком.
  */
-export type FieldConflict = ConflictValues & { readonly kind: 'field'; readonly field: string } & (
-    | { readonly record: 'node'; readonly id: NodeId }
-    | { readonly record: 'task'; readonly id: TaskId }
-  );
+export type FieldConflict = Decision &
+  RecordRef & {
+    readonly kind: 'field';
+    readonly field: string;
+    /** Значение в базе; undefined — записи в базе не было (её добавили с обеих сторон). */
+    readonly base: unknown;
+    readonly branch: unknown;
+    readonly target: unknown;
+  };
 
-export type MergeConflict = FieldConflict;
+/**
+ * Запись удалена с одной стороны (deletedIn), а с другой в ней или на ней что-то изменилось:
+ * её поля, задачи и ноды внутри (в том числе новые и перенесённые туда), новые стрелки к ней или
+ * от неё. id — верхняя удалённая запись: роадмапа, блок или задача; всё удалённое внутри неё
+ * решается вместе с ней. «Как в ветке» и «как в целевой» — запись остаётся или удаляется так,
+ * как на этой стороне, вместе со всем, что в ней на другой стороне.
+ */
+export type DeletedConflict = Decision &
+  RecordRef & { readonly kind: 'deleted'; readonly deletedIn: MergeSide };
+
+/**
+ * Нода превращена с одной стороны (блок ↔ роадмапа), а с другой в неё добавили то, что новому
+ * типу не подходит: ноды в блок или задачи в роадмапу, внутри которой нет нового блока для них.
+ * Остаётся тип выбранной стороны, а неподходящее ему содержимое удаляется.
+ */
+export type TypeConflict = Decision & {
+  readonly kind: 'type';
+  readonly record: 'node';
+  readonly id: NodeId;
+  readonly branch: NodeType;
+  readonly target: NodeType;
+};
+
+export type MergeConflict = FieldConflict | DeletedConflict | TypeConflict;
 
 export type MergeOptions = {
   /** Решения конфликтов по ключу. Решение, для которого конфликта нет, не используется. */
@@ -152,12 +190,40 @@ const GROUPS: Readonly<Record<'node' | 'task', readonly (readonly string[])[]>> 
 /** Что взять, когда группа полей изменена с обеих сторон по-разному. */
 type Divergence = MergeSide | { readonly value: unknown };
 
-class RecordMerger {
+/** Конфликты и решения к ним. */
+class Decisions {
   readonly conflicts: MergeConflict[] = [];
+
+  constructor(private readonly resolutions: ReadonlyMap<string, MergeSide>) {}
+
+  /** Решение по ключу; null — не решён. */
+  chosen(key: string): MergeSide | null {
+    const wanted = this.resolutions.get(key);
+    return wanted === 'branch' || wanted === 'target' ? wanted : null;
+  }
+
+  add(conflict: MergeConflict): void {
+    this.conflicts.push(conflict);
+  }
+
+  sorted(): MergeConflict[] {
+    const kinds: readonly MergeConflict['kind'][] = ['deleted', 'type', 'field'];
+    const fieldOf = (conflict: MergeConflict) => (conflict.kind === 'field' ? conflict.field : '');
+    return this.conflicts.sort(
+      (a, b) =>
+        byId(a.record, b.record) ||
+        byId(a.id, b.id) ||
+        kinds.indexOf(a.kind) - kinds.indexOf(b.kind) ||
+        byId(fieldOf(a), fieldOf(b)),
+    );
+  }
+}
+
+class RecordMerger {
   readonly positionsKept: NodeId[] = [];
 
   constructor(
-    private readonly resolutions: ReadonlyMap<string, MergeSide>,
+    private readonly decisions: Decisions,
     private readonly keepTargetPositions: ReadonlySet<NodeId>,
   ) {}
 
@@ -276,8 +342,7 @@ class RecordMerger {
     target: Fields,
   ): MergeSide {
     const key = `field:${field}:${record}:${id}`;
-    const wanted = this.resolutions.get(key);
-    const chosen = wanted === 'branch' || wanted === 'target' ? wanted : null;
+    const chosen = this.decisions.chosen(key);
     const values = {
       key,
       field,
@@ -286,7 +351,7 @@ class RecordMerger {
       target: ownField(target, field),
       chosen,
     };
-    this.conflicts.push(
+    this.decisions.add(
       record === 'node'
         ? { kind: 'field', record, id: id as NodeId, ...values }
         : { kind: 'field', record, id: id as TaskId, ...values },
@@ -295,50 +360,324 @@ class RecordMerger {
   }
 }
 
-// ---- Слияние графов ----
+// ---- Записи с разных сторон ----
 
-type Writer<K extends string, V> = {
-  readonly put: (value: V) => void;
-  readonly remove: (id: K) => void;
+const same = <V>(a: V | undefined, b: V | undefined): boolean =>
+  a === b || (a !== undefined && b !== undefined && sameValue(a, b));
+
+/** Поля, изменение которых не меняет смысла записи: позиция, порядок в блоке, последствия, авторство. */
+const COSMETIC: ReadonlySet<string> = new Set([
+  'x',
+  'y',
+  'order',
+  'warnings',
+  'countedDone',
+  'number',
+  'createdBy',
+  'createdAt',
+  'updatedBy',
+  'updatedAt',
+]);
+
+/** Запись изменена по смыслу. Сдвинутая нода или полученное предупреждение удалению не мешают. */
+function meaningChanged(before: object, after: object): boolean {
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (!COSMETIC.has(key) && !sameValue(ownField(before, key), ownField(after, key))) return true;
+  }
+  return false;
+}
+
+/** Записи одного вида, разобранные по сторонам. */
+type Sorted<K, V> = {
+  /** Есть с обеих сторон, и итог слияния полей отличается от целевой записи. */
+  readonly merged: Map<K, V>;
+  /** Новые в ветке: нет ни в базе, ни в целевой. */
+  readonly branchNew: Map<K, V>;
+  /** Удалены в целевой, есть в ветке: запись из ветки. */
+  readonly deletedInTarget: Map<K, V>;
+  /** Удалены в ветке, есть в целевой: запись из целевой. */
+  readonly deletedInBranch: Map<K, V>;
 };
 
 /**
- * Записи одного вида. Смотрим только то, что изменила ветка: остальное в целевом графе уже как
- * надо. Изменённое только веткой берётся из ветки, изменённое с обеих сторон — сливается.
+ * Смотрим записи ветки и базы; записи, которых нет ни там, ни там, — новые в целевой, они уже
+ * в результате. Изменённое только веткой берётся из ветки, изменённое с обеих сторон — сливается.
  */
-function mergeRecords<K extends string, V extends { readonly id: K }>(
+function sortRecords<K extends string, V extends { readonly id: K }>(
   base: ReadonlyMap<K, V>,
   branch: ReadonlyMap<K, V>,
   target: ReadonlyMap<K, V>,
-  writer: Writer<K, V>,
   mergeBoth: (base: V | undefined, branch: V, target: V) => V,
-): void {
-  const same = (a: V | undefined, b: V | undefined) =>
-    a === b || (a !== undefined && b !== undefined && sameValue(a, b));
+): Sorted<K, V> {
+  const sorted: Sorted<K, V> = {
+    merged: new Map(),
+    branchNew: new Map(),
+    deletedInTarget: new Map(),
+    deletedInBranch: new Map(),
+  };
   for (const [id, ours] of branch) {
     const was = base.get(id);
-    if (same(was, ours)) continue;
     const theirs = target.get(id);
     if (theirs === undefined) {
-      // Удалённое в целевой ветке и изменённое в ветке — подшаг 2b; пока остаётся удалённым.
-      if (was === undefined) writer.put(ours);
+      if (was === undefined) sorted.branchNew.set(id, ours);
+      else sorted.deletedInTarget.set(id, ours);
       continue;
     }
-    if (theirs === ours) continue;
-    const merged = was !== undefined && same(was, theirs) ? ours : mergeBoth(was, ours, theirs);
-    if (merged !== theirs) writer.put(merged);
+    if (theirs === ours || same(was, ours)) continue;
+    const result = was !== undefined && same(was, theirs) ? ours : mergeBoth(was, ours, theirs);
+    if (result !== theirs) sorted.merged.set(id, result);
   }
-  for (const [id, was] of base) {
+  for (const id of base.keys()) {
     if (branch.has(id)) continue;
-    // Удалённое в ветке и изменённое в целевой — подшаг 2b; пока остаётся как в целевой.
-    if (same(was, target.get(id))) writer.remove(id);
+    const theirs = target.get(id);
+    if (theirs !== undefined) sorted.deletedInBranch.set(id, theirs);
   }
+  return sorted;
+}
+
+// ---- Удалённое с одной стороны ----
+
+/**
+ * Удалённое с одной стороны вместе со всем, что на другой стороне лежит внутри него: решается
+ * целиком. Корень — верхняя удалённая запись.
+ */
+type Unit = {
+  readonly root: RecordRef;
+  readonly deletedIn: MergeSide;
+  /** Сам корень и всё внутри него: удалённое на стороне deletedIn и новое на другой стороне. */
+  readonly nodes: ReadonlySet<NodeId>;
+  readonly tasks: ReadonlySet<TaskId>;
+  /** Задачи, которые другая сторона перенесла внутрь удалённого. */
+  readonly movedIn: ReadonlySet<TaskId>;
+  /** Другая сторона что-то в нём меняла: тогда это конфликт, иначе удаление просто применяется. */
+  readonly touched: boolean;
+};
+
+type UnitSides = {
+  readonly deletedIn: MergeSide;
+  readonly base: Graph;
+  /** Сторона, где удалённое осталось. */
+  readonly kept: Graph;
+  /** Сторона, где его удалили. */
+  readonly deleter: Graph;
+  readonly deletedNodes: ReadonlyMap<NodeId, GraphNode>;
+  readonly deletedTasks: ReadonlyMap<TaskId, Task>;
+  /** Блок задачи, которая есть с обеих сторон, после слияния полей. */
+  readonly finalBlockOf: (id: TaskId) => NodeId | undefined;
+};
+
+function findUnits(sides: UnitSides): Unit[] {
+  const { base, kept, deleter, deletedNodes, deletedTasks } = sides;
+  const view = viewOf(kept);
+  const isNewNode = (id: NodeId) => !base.nodes.has(id) && !deleter.nodes.has(id);
+  const isNewTask = (id: TaskId) => !base.tasks.has(id) && !deleter.tasks.has(id);
+  /** Лежит ли контейнер внутри удалённого — напрямую или через новые ноды. */
+  const insideDeleted = (container: NodeId | null): boolean => {
+    for (let id = container; id !== null;) {
+      if (deletedNodes.has(id)) return true;
+      const node = kept.nodes.get(id);
+      if (node === undefined || !isNewNode(id)) return false;
+      id = node.parentId;
+    }
+    return false;
+  };
+
+  const unitOf = (
+    root: RecordRef,
+    nodes: Set<NodeId>,
+    tasks: Set<TaskId>,
+    movedIn: Set<TaskId>,
+  ): Unit => {
+    const edges = new Set<EdgeId>();
+    for (const id of nodes) {
+      for (const edgeId of view.edgesInto(id)) edges.add(edgeId);
+      for (const edgeId of view.edgesOut(id)) edges.add(edgeId);
+    }
+    for (const id of [...tasks, ...movedIn]) {
+      for (const edgeId of view.edgesFromTask(id)) edges.add(edgeId);
+    }
+    const changed = <V extends object>(was: V | undefined, now: V | undefined) =>
+      was === undefined || (now !== undefined && meaningChanged(was, now));
+    const touched =
+      movedIn.size > 0 ||
+      [...nodes].some((id) => changed(base.nodes.get(id), kept.nodes.get(id))) ||
+      [...tasks].some((id) => changed(base.tasks.get(id), kept.tasks.get(id))) ||
+      [...edges].some((id) => !base.edges.has(id));
+    return { root, deletedIn: sides.deletedIn, nodes, tasks, movedIn, touched };
+  };
+
+  const units: Unit[] = [];
+  for (const [rootId, node] of deletedNodes) {
+    if (insideDeleted(node.parentId)) continue;
+    const nodes = new Set<NodeId>();
+    const tasks = new Set<TaskId>();
+    const movedIn = new Set<TaskId>();
+    const stack = [rootId];
+    for (let id = stack.pop(); id !== undefined; id = stack.pop()) {
+      nodes.add(id);
+      for (const childId of view.childrenOf(id)) {
+        if (deletedNodes.has(childId) || isNewNode(childId)) stack.push(childId);
+      }
+      for (const taskId of view.tasksIn(id)) {
+        if (deletedTasks.has(taskId) || isNewTask(taskId)) tasks.add(taskId);
+        else if (sides.finalBlockOf(taskId) === id) movedIn.add(taskId);
+      }
+    }
+    units.push(unitOf({ record: 'node', id: rootId }, nodes, tasks, movedIn));
+  }
+  for (const [id, task] of deletedTasks) {
+    if (insideDeleted(task.blockId)) continue;
+    units.push(unitOf({ record: 'task', id }, new Set(), new Set([id]), new Set()));
+  }
+  return units;
+}
+
+/** Удалённое остаётся в результате: возвращается из ветки или не удаляется из целевой. */
+function decideUnit(unit: Unit, decisions: Decisions): boolean {
+  if (!unit.touched) return false;
+  const key = `deleted:${unit.root.record}:${unit.root.id}`;
+  const chosen = decisions.chosen(key);
+  decisions.add({ kind: 'deleted', key, ...unit.root, deletedIn: unit.deletedIn, chosen });
+  return unit.deletedIn === 'target' ? chosen === 'branch' : chosen !== 'branch';
+}
+
+// ---- Запись в результат ----
+
+function removeTaskWithEdges(draft: GraphDraft, id: TaskId): void {
+  for (const edgeId of [...draft.edgesFromTask(id)]) draft.removeEdge(edgeId);
+  draft.removeTask(id);
+}
+
+/** Нода и стрелки в неё и от неё самой. Стрелки её задач уходят вместе с задачами. */
+function removeNodeWithEdges(draft: GraphDraft, id: NodeId): void {
+  for (const edgeId of [...draft.edgesInto(id)]) draft.removeEdge(edgeId);
+  for (const edgeId of [...draft.edgesOut(id)]) {
+    if (draft.edge(edgeId)?.source.kind === 'node') draft.removeEdge(edgeId);
+  }
+  draft.removeNode(id);
+}
+
+type Refs = { readonly nodes: ReadonlySet<NodeId>; readonly tasks: ReadonlySet<TaskId> };
+
+function touches(edge: GraphEdge, refs: Refs): boolean {
+  const { source } = edge;
+  return (
+    refs.nodes.has(edge.target.nodeId) ||
+    (source.kind === 'node' ? refs.nodes.has(source.nodeId) : refs.tasks.has(source.taskId))
+  );
+}
+
+function refsOf(units: readonly Unit[]): Refs {
+  return {
+    nodes: new Set(units.flatMap((unit) => [...unit.nodes])),
+    tasks: new Set(units.flatMap((unit) => [...unit.tasks])),
+  };
 }
 
 /**
+ * Стрелка из ветки, если может встать: концы есть и такой же стрелки ещё нет. Стрелка к тому,
+ * что не вернулось, не встаёт — это решение конфликта удаления. Петли и циклы — подшаг 2c.
+ */
+function putBranchEdge(draft: GraphDraft, edge: GraphEdge): void {
+  const problem = checkEdge(draft, edge);
+  if (problem === null || problem.code === 'SELF_LOOP') draft.putEdge(edge);
+}
+
+/** Новый блок внутри роадмапы на превратившей её стороне: самый ранний, при равенстве — по id. */
+function innerBlock(
+  draft: GraphDraft,
+  base: Graph,
+  converter: Graph,
+  roadmapId: NodeId,
+): NodeId | undefined {
+  let best: GraphNode | undefined;
+  for (const childId of viewOf(converter).childrenOf(roadmapId)) {
+    const child = converter.nodes.get(childId);
+    if (!child || child.type !== 'block' || base.nodes.has(childId)) continue;
+    if (draft.node(childId)?.type !== 'block') continue;
+    if (
+      best === undefined ||
+      child.createdAt < best.createdAt ||
+      (child.createdAt === best.createdAt && child.id < best.id)
+    ) {
+      best = child;
+    }
+  }
+  return best?.id;
+}
+
+/**
+ * Блок ↔ роадмапа с одной стороны против содержимого с другой. Задачи, попавшие в ставший
+ * роадмапой блок, переезжают в новый блок внутри неё (самый ранний: туда превращение перенесло
+ * задачи блока). Если такого блока нет или в ставшую блоком роадмапу добавили ноды — конфликт.
+ */
+function settleTypes(
+  draft: GraphDraft,
+  base: Graph,
+  branch: Graph,
+  target: Graph,
+  decisions: Decisions,
+): void {
+  const changed: NodeId[] = [];
+  for (const [id, ours] of branch.nodes) {
+    const theirs = target.nodes.get(id);
+    if (theirs !== undefined && theirs.type !== ours.type) changed.push(id);
+  }
+  for (const id of changed.sort(byId)) {
+    const node = draft.node(id);
+    const ours = branch.nodes.get(id);
+    const theirs = target.nodes.get(id);
+    if (!node || !ours || !theirs || node.type === 'milestone') continue;
+    if (node.type === 'roadmap') {
+      const stray = [...draft.tasksIn(id)];
+      if (stray.length === 0) continue;
+      const inner = innerBlock(draft, base, node.type === ours.type ? branch : target, id);
+      if (inner !== undefined) {
+        for (const taskId of stray) {
+          const task = draft.task(taskId);
+          if (task) draft.putTask({ ...task, blockId: inner });
+        }
+        continue;
+      }
+    } else if (draft.childrenOf(id).size === 0) {
+      continue;
+    }
+    const key = `type:node:${id}`;
+    const chosen = decisions.chosen(key);
+    decisions.add({
+      kind: 'type',
+      key,
+      record: 'node',
+      id,
+      branch: ours.type,
+      target: theirs.type,
+      chosen,
+    });
+    const type = (chosen === 'branch' ? ours : theirs).type;
+    if (type === 'milestone') continue;
+    if (type !== node.type) draft.putNode({ ...node, type });
+    if (type === 'roadmap') {
+      for (const taskId of [...draft.tasksIn(id)]) removeTaskWithEdges(draft, taskId);
+    } else {
+      for (const childId of [...draft.childrenOf(id)]) {
+        for (const taskId of [...draft.tasksIn(childId)]) removeTaskWithEdges(draft, taskId);
+        removeNodeWithEdges(draft, childId);
+      }
+    }
+  }
+}
+
+function must<V>(value: V | undefined): V {
+  if (value === undefined) throw new Error('merge: запись должна быть');
+  return value;
+}
+
+// ---- Слияние графов ----
+
+/**
  * Трёхстороннее слияние: base — граф на момент ответвления, branch — что вливаем, target —
- * текущая версия целевой ветки. Нерешённый конфликт оставляет значение целевой ветки; мерж
- * возможен, когда решены все конфликты. Ошибка — если результат нарушил бы инвариант.
+ * текущая версия целевой ветки. Нерешённый конфликт оставляет всё как в целевой ветке; мерж
+ * возможен, когда решены все конфликты. Ошибка — если результат нарушил бы инвариант или лимит.
  */
 export function merge(
   base: Graph,
@@ -347,47 +686,103 @@ export function merge(
   ctx: ApplyContext,
   options: MergeOptions = {},
 ): Result<Merged> {
-  const draft = new GraphDraft(target);
-  const merger = new RecordMerger(
-    options.resolutions ?? new Map(),
-    options.keepTargetPositions ?? new Set(),
+  const decisions = new Decisions(options.resolutions ?? new Map());
+  const merger = new RecordMerger(decisions, options.keepTargetPositions ?? new Set());
+  const nodes = sortRecords(base.nodes, branch.nodes, target.nodes, (was, ours, theirs) =>
+    merger.merge('node', was, ours, theirs),
   );
-  mergeRecords(
-    base.nodes,
-    branch.nodes,
-    target.nodes,
-    { put: (node) => draft.putNode(node), remove: (id) => draft.removeNode(id) },
-    (was, ours, theirs) => merger.merge('node', was, ours, theirs),
+  const tasks = sortRecords(base.tasks, branch.tasks, target.tasks, (was, ours, theirs) =>
+    merger.merge('task', was, ours, theirs),
   );
-  mergeRecords(
-    base.tasks,
-    branch.tasks,
-    target.tasks,
-    { put: (task) => draft.putTask(task), remove: (id) => draft.removeTask(id) },
-    (was, ours, theirs) => merger.merge('task', was, ours, theirs),
-  );
-  // Стрелки не меняются, только появляются и удаляются: с обеих сторон одна и та же стрелка.
-  mergeRecords(
-    base.edges,
-    branch.edges,
-    target.edges,
-    { put: (edge) => draft.putEdge(edge), remove: (id) => draft.removeEdge(id) },
-    (_was, _ours, theirs) => theirs,
-  );
+  const finalBlockOf = (id: TaskId) => (tasks.merged.get(id) ?? target.tasks.get(id))?.blockId;
+  const units = [
+    ...findUnits({
+      deletedIn: 'target',
+      base,
+      kept: branch,
+      deleter: target,
+      deletedNodes: nodes.deletedInTarget,
+      deletedTasks: tasks.deletedInTarget,
+      finalBlockOf,
+    }),
+    ...findUnits({
+      deletedIn: 'branch',
+      base,
+      kept: target,
+      deleter: branch,
+      deletedNodes: nodes.deletedInBranch,
+      deletedTasks: tasks.deletedInBranch,
+      finalBlockOf,
+    }),
+  ];
+  const kept = new Set(units.filter((unit) => decideUnit(unit, decisions)));
+  const restored = refsOf(units.filter((unit) => unit.deletedIn === 'target' && kept.has(unit)));
+  const notDeleted = refsOf(units.filter((unit) => unit.deletedIn === 'branch' && kept.has(unit)));
+  const insideDeleted = refsOf(units.filter((unit) => unit.deletedIn === 'target'));
 
-  const problem = checkStep(draft, draft.peekStep());
+  const draft = new GraphDraft(target);
+  // Изменённое с обеих сторон и новое в ветке. Новое внутри удалённого в целевой — вместе с ним.
+  for (const node of nodes.merged.values()) draft.putNode(node);
+  for (const task of tasks.merged.values()) draft.putTask(task);
+  for (const [id, node] of nodes.branchNew) if (!insideDeleted.nodes.has(id)) draft.putNode(node);
+  for (const [id, task] of tasks.branchNew) if (!insideDeleted.tasks.has(id)) draft.putTask(task);
+
+  // Удалённое с одной стороны: возвращается из ветки, удаляется из целевой или остаётся.
+  for (const unit of units) {
+    if (unit.deletedIn === 'target' && kept.has(unit)) {
+      for (const id of unit.nodes) draft.putNode(must(branch.nodes.get(id)));
+      for (const id of unit.tasks) draft.putTask(must(branch.tasks.get(id)));
+    } else if (unit.deletedIn === 'branch' && !kept.has(unit)) {
+      for (const id of unit.tasks) removeTaskWithEdges(draft, id);
+      for (const id of unit.nodes) removeNodeWithEdges(draft, id);
+    }
+  }
+  // Перенесённое внутрь удалённого, если оно удаляется: место — с той стороны, где удалили.
+  // Если и там блока больше нет, задача уходит вместе с удалённым.
+  for (const unit of units) {
+    if (kept.has(unit)) continue;
+    const deleter = unit.deletedIn === 'target' ? target : branch;
+    for (const id of unit.movedIn) {
+      const task = draft.task(id);
+      const there = deleter.tasks.get(id);
+      if (!task || !there) continue;
+      if (draft.node(there.blockId)?.type !== 'block') {
+        removeTaskWithEdges(draft, id);
+        continue;
+      }
+      const placed = { ...task, blockId: there.blockId, order: there.order };
+      const theirs = target.tasks.get(id);
+      draft.putTask(theirs !== undefined && sameValue(placed, theirs) ? theirs : placed);
+    }
+  }
+
+  // Стрелки: удалённые в ветке уходят, если не держатся за оставленное; новые в ветке встают;
+  // удалённые в целевой возвращаются вместе с возвращённым из ветки.
+  for (const [id, edge] of base.edges) {
+    const inBranch = branch.edges.get(id);
+    const inTarget = target.edges.has(id);
+    if (inBranch === undefined && inTarget) {
+      if (!touches(edge, notDeleted)) draft.removeEdge(id);
+    } else if (inBranch !== undefined && !inTarget && touches(edge, restored)) {
+      putBranchEdge(draft, inBranch);
+    }
+  }
+  for (const [id, edge] of branch.edges) {
+    if (!base.edges.has(id) && !target.edges.has(id)) putBranchEdge(draft, edge);
+  }
+
+  settleTypes(draft, base, branch, target, decisions);
+
+  const problem = checkLimits(draft) ?? checkStep(draft, draft.peekStep());
   if (problem) return { ok: false, error: problem };
 
-  const conflicts = merger.conflicts.sort(
-    (a, b) => byId(a.record, b.record) || byId(a.id, b.id) || byId(a.field, b.field),
-  );
   const changes = changesOfDraft(draft, ctx.now);
   return {
     ok: true,
     value: {
       graph: draft.finish(),
       changes,
-      conflicts,
+      conflicts: decisions.sorted(),
       positionsKept: merger.positionsKept.sort(byId),
     },
   };

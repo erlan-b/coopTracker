@@ -10,4 +10,12 @@ export { deadlinePassed, graphStates } from './states';
 export type { GraphStates, NodeState, NodeView, Now, Summary, TaskState, TaskView } from './states';
 export type { RevertSkip } from './revert';
 export { merge } from './merge';
-export type { FieldConflict, MergeConflict, MergeOptions, MergeSide, Merged } from './merge';
+export type {
+  DeletedConflict,
+  FieldConflict,
+  MergeConflict,
+  MergeOptions,
+  MergeSide,
+  Merged,
+  TypeConflict,
+} from './merge';

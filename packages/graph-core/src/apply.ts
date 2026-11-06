@@ -179,7 +179,7 @@ function applyToDraft(
 }
 
 /** Граф ветки не растёт сверх LIMITS. Если он уже больше (лимит уменьшили), расти ему нельзя. */
-function checkLimits(draft: GraphDraft): GraphError | null {
+export function checkLimits(draft: GraphDraft): GraphError | null {
   const { base } = draft;
   const over = (records: 'nodes' | 'tasks' | 'edges', limit: number): GraphError | null =>
     draft[records].size > limit && draft[records].size > base[records].size

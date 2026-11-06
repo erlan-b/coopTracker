@@ -5,6 +5,8 @@ import { applyOp, applyOps } from './apply';
 import type { Applied } from './apply';
 import { evaluate } from './doneness';
 import { buildIndex, cachedDerived, viewOf } from './draft';
+import { merge } from './merge';
+import type { MergeOptions, Merged } from './merge';
 import type { GraphError, Result } from './errors';
 import { asEdgeId, asNodeId, asTaskId, asUserId } from './ids';
 import { checkGraph } from './invariants';
@@ -303,3 +305,27 @@ export const setStatus = (id: string, status: TaskStatus): Op => ({
   id: T(id),
   patch: { status },
 });
+
+// ---- Слияние ----
+
+/**
+ * merge с замороженными графами. Проверяет: результат корректен целиком, изменения совпадают
+ * с полным сравнением целевого графа и результата (неизменённое — те же объекты), запомненное
+ * для результата совпадает с посчитанным заново.
+ */
+export function mergeChecked(
+  base: Graph,
+  branch: Graph,
+  target: Graph,
+  context: ApplyContext,
+  options: MergeOptions = {},
+): Merged {
+  for (const graph of [base, branch, target]) deepFreeze(graph);
+  const result = merge(base, branch, target, context, options);
+  if (!result.ok) throw new Error(`слияние отклонено: ${JSON.stringify(result.error)}`);
+  const { graph, changes } = result.value;
+  expect(checkGraph(graph)).toBeNull();
+  expect(changes).toEqual(referenceChanges(target, graph, context.now));
+  expectDerivedConsistent(graph);
+  return result.value;
+}
