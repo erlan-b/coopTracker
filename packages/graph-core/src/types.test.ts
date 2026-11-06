@@ -51,7 +51,7 @@ describe('брендированные id', () => {
   it('задачу нельзя прочитать по id ноды', () => {
     const read = (graph: Graph, id: NodeId) =>
       // @ts-expect-error — id ноды не подходит как ключ словаря задач
-      graph.tasks[id];
+      graph.tasks.get(id);
     expect(read).toBeTypeOf('function');
   });
 });

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   E,
   N,
+  NOW,
   T,
   apply,
   applyOk,
@@ -17,6 +18,7 @@ import {
   task,
   taskEdge,
 } from './test-helpers';
+import { LIMITS } from './types';
 import type { Graph, GraphEdge, GraphNode, Op, Task } from './types';
 
 const restoreOp = (
@@ -25,9 +27,9 @@ const restoreOp = (
   edges: readonly GraphEdge[] = [],
 ): Op => ({ kind: 'restore', nodes, tasks, edges });
 
-const nodeOf = (graph: Graph, id: string) => must(graph.nodes[N(id)]);
-const taskOf = (graph: Graph, id: string) => must(graph.tasks[T(id)]);
-const edgeOf = (graph: Graph, id: string) => must(graph.edges[E(id)]);
+const nodeOf = (graph: Graph, id: string) => must(graph.nodes.get(N(id)));
+const taskOf = (graph: Graph, id: string) => must(graph.tasks.get(T(id)));
+const edgeOf = (graph: Graph, id: string) => must(graph.edges.get(E(id)));
 
 describe('restore', () => {
   it('возвращает удалённый блок с задачами и стрелками как был', () => {
@@ -112,7 +114,7 @@ describe('restore', () => {
       withoutC,
       restoreOp([nodeOf(graph, 'b')], [], [edgeOf(graph, 'ab'), edgeOf(graph, 'bc')]),
     );
-    expect(Object.keys(restored.edges)).toEqual(['ab']);
+    expect([...restored.edges.keys()]).toEqual(['ab']);
   });
 
   it('стрелка, которая теперь замкнула бы цикл или повторила бы существующую, пропускается', () => {
@@ -156,6 +158,41 @@ describe('restore', () => {
       current,
       restoreOp([], [], [edgeOf(graph, 'ab'), edgeOf(graph, 'cb')]),
     );
-    expect(Object.keys(restored.edges).sort()).toEqual(['ba', 'cb']);
+    expect([...restored.edges.keys()].sort()).toEqual(['ba', 'cb']);
+  });
+});
+
+describe('restore принимает только знакомое', () => {
+  it('лишние поля, в том числе вложенные, в граф не попадают', () => {
+    const graph = build(block('a'), block('b'), task('t', 'a'), edge('ab', 'a', 'b'));
+    const deleted = applyOk(graph, { kind: 'deleteNode', id: N('a') });
+    const dirtyNode = { ...nodeOf(graph, 'a'), evil: 1 };
+    const dirtyTask = {
+      ...taskOf(graph, 't'),
+      deadline: { kind: 'date' as const, date: '2026-12-01', x: 1 },
+    };
+    const dirtyEdge = {
+      ...edgeOf(graph, 'ab'),
+      target: { kind: 'node' as const, nodeId: N('b'), x: 1 },
+    };
+    const restored = applyOk(deleted, restoreOp([dirtyNode], [dirtyTask], [dirtyEdge]));
+    expect(restored.nodes.get(N('a'))).toEqual(nodeOf(graph, 'a'));
+    expect(restored.tasks.get(T('t'))?.deadline).toEqual({ kind: 'date', date: '2026-12-01' });
+    expect(restored.edges.get(E('ab'))).toEqual(edgeOf(graph, 'ab'));
+  });
+
+  it(`задача с больше чем ${LIMITS.maxWarnings} предупреждениями не возвращается`, () => {
+    const graph = build(block('a'), task('t', 'a'));
+    const deleted = applyOk(graph, { kind: 'deleteTask', id: T('t') });
+    const warning = { source: { kind: 'node' as const, nodeId: N('a') }, at: NOW };
+    const crowded = {
+      ...taskOf(graph, 't'),
+      warnings: Array.from({ length: LIMITS.maxWarnings + 1 }, () => warning),
+    };
+    expect(errorOf(apply(deleted, restoreOp([], [crowded])))).toEqual({
+      code: 'INVALID_VALUE',
+      field: 'warnings',
+      reason: 'too_many',
+    });
   });
 });

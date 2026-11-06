@@ -3,21 +3,14 @@
 // после вашего действия, ваша сторона — «до», другая — текущий граф. Где другой уже поменял
 // поле, остаётся его значение, а поле попадает в список пропущенного (подсказка в интерфейсе).
 
-import { settle, sourceKey } from './consequences';
-import type { Result } from './errors';
-import type { NodeId, TaskId, UserId } from './ids';
-import { checkEdge, checkGraph, cycleError } from './invariants';
-import { getOwn, putAll, removeAll, valuesOf } from './records';
-import type {
-  ApplyContext,
-  Changes,
-  Graph,
-  GraphEdge,
-  GraphNode,
-  RecordChange,
-  Task,
-  TaskWarning,
-} from './types';
+import { sourceKey } from './consequences';
+import type { GraphDraft } from './draft';
+import type { GraphError } from './errors';
+import type { EdgeId, NodeId, TaskId, UserId } from './ids';
+import { knownEdge, knownNode, knownTask } from './fields';
+import { checkStep, putEdgesIfValid } from './invariants';
+import { LIMITS } from './types';
+import type { Changes, GraphEdge, GraphNode, RecordChange, Task, TaskWarning } from './types';
 import { ownField, sameValue } from './values';
 
 /** Что отмена не вернула. */
@@ -37,61 +30,6 @@ export type RevertSkip = {
   readonly by: UserId | null;
 };
 
-export type Reverted = { readonly graph: Graph; readonly skipped: readonly RevertSkip[] };
-
-/**
- * Отмена целиком: граф после отмены (с предупреждениями и пометками) и что не вернулось.
- * Предупреждения получают только задачи, изменённые после отменяемого действия: быстрая
- * отмена ошибки никого не дёргает. Права на статусы не проверяются — это возврат прежнего
- * состояния; если граф после отмены нарушил бы инвариант, отмена отклоняется целиком.
- */
-export function planRevert(current: Graph, changes: Changes, ctx: ApplyContext): Result<Reverted> {
-  const candidate = revertCandidate(current, changes, ctx);
-  if (!candidate.ok || candidate.value.graph === current) return candidate;
-  const graph = settle(current, candidate.value.graph, ctx, {
-    keepDone: false,
-    warnOnlyChangedAfter: changes.at,
-  });
-  return { ok: true, value: { graph, skipped: candidate.value.skipped } };
-}
-
-// ---- Черновик: изменения поверх текущих записей без мутаций ----
-
-type Draft<K extends string, V extends { readonly id: K }> = {
-  readonly get: (id: K) => V | undefined;
-  readonly put: (value: V) => void;
-  readonly remove: (id: K) => void;
-  readonly unremove: (id: K) => void;
-  readonly isRemoved: (id: K) => boolean;
-  readonly values: () => V[];
-  readonly toRecord: () => Readonly<Record<K, V>>;
-};
-
-function draftOf<K extends string, V extends { readonly id: K }>(
-  base: Readonly<Record<K, V>>,
-): Draft<K, V> {
-  const puts = new Map<K, V>();
-  const removed = new Set<K>();
-  return {
-    get: (id) => (removed.has(id) ? undefined : (puts.get(id) ?? getOwn(base, id))),
-    put: (value) => {
-      removed.delete(value.id);
-      puts.set(value.id, value);
-    },
-    remove: (id) => {
-      puts.delete(id);
-      removed.add(id);
-    },
-    unremove: (id) => removed.delete(id),
-    isRemoved: (id) => removed.has(id),
-    values: () => [
-      ...valuesOf(base).filter((value) => !removed.has(value.id) && !puts.has(value.id)),
-      ...puts.values(),
-    ],
-    toRecord: () => removeAll(putAll(base, [...puts.values()]), removed),
-  };
-}
-
 // ---- Слияние одной записи по полям ----
 
 /** Поля, которые меняются сами вместе с правкой. Расхождение в них — не повод для подсказки. */
@@ -106,6 +44,13 @@ const SET_FIELDS: Readonly<Record<string, (item: unknown) => string>> = {
     return `${sourceKey(warning.source)}@${warning.at}`;
   },
 };
+
+/** Слияние может вернуть больше предупреждений, чем допустимо: уходят самые старые по времени. */
+function keepNewestWarnings(warnings: readonly TaskWarning[]): readonly TaskWarning[] {
+  if (warnings.length <= LIMITS.maxWarnings) return warnings;
+  const byTime = [...warnings].sort((x, y) => (x.at < y.at ? -1 : x.at > y.at ? 1 : 0));
+  return byTime.slice(-LIMITS.maxWarnings);
+}
 
 function mergeSet(
   before: readonly unknown[],
@@ -149,6 +94,7 @@ function mergeRecord<V extends object>(
       value = was;
     } else if (keyOf && Array.isArray(was) && Array.isArray(became) && Array.isArray(now)) {
       value = mergeSet(was, became, now, keyOf);
+      if (key === 'warnings') value = keepNewestWarnings(value as TaskWarning[]);
     } else {
       if (!AUTHORSHIP_FIELDS.has(key)) conflicts.push(key);
       continue;
@@ -172,6 +118,15 @@ function lastEditor(record: object | undefined): UserId | null {
   return typeof by === 'string' ? (by as UserId) : null;
 }
 
+/** Как читать и писать записи одного вида в рабочей копии. */
+type Access<K extends string, V> = {
+  readonly get: (id: K) => V | undefined;
+  readonly put: (value: V) => void;
+  readonly remove: (id: K) => void;
+  /** Запись только из известных полей: Changes приходит от клиента. */
+  readonly known: (value: V) => V;
+};
+
 /**
  * Созданное действием удаляется, если с тех пор не менялось; удалённое — запоминается для
  * восстановления; изменённое — сливается по полям.
@@ -179,26 +134,26 @@ function lastEditor(record: object | undefined): UserId | null {
 function revertRecords<K extends string, V extends { readonly id: K }>(
   record: RecordKind,
   list: readonly RecordChange<V>[],
-  draft: Draft<K, V>,
+  access: Access<K, V>,
   skipped: RevertSkip[],
-): { readonly removed: K[]; readonly toRestore: V[] } {
-  const removed: K[] = [];
+): { readonly removed: V[]; readonly toRestore: V[] } {
+  const removed: V[] = [];
   const toRestore: V[] = [];
   for (const { before, after } of list) {
     const id = (before ?? after)?.id;
     if (id === undefined) continue;
-    const current = draft.get(id);
+    const current = access.get(id);
     if (before === null) {
       if (current === undefined) continue;
       if (sameValue(current, after)) {
-        draft.remove(id);
-        removed.push(id);
+        access.remove(id);
+        removed.push(current);
       } else {
         skipped.push({ record, id, field: null, reason: 'changed', by: lastEditor(current) });
       }
     } else if (after === null) {
       // Если запись уже вернули (например, из корзины), делать нечего.
-      if (current === undefined) toRestore.push(before);
+      if (current === undefined) toRestore.push(access.known(before));
     } else if (current === undefined) {
       skipped.push({ record, id, field: null, reason: 'deleted', by: null });
     } else {
@@ -206,7 +161,8 @@ function revertRecords<K extends string, V extends { readonly id: K }>(
       for (const field of merged.conflicts) {
         skipped.push({ record, id, field, reason: 'changed', by: lastEditor(current) });
       }
-      if (!sameValue(merged.record, current)) draft.put(merged.record);
+      const result = access.known(merged.record);
+      if (!sameValue(result, current)) access.put(result);
     }
   }
   return { removed, toRestore };
@@ -214,58 +170,78 @@ function revertRecords<K extends string, V extends { readonly id: K }>(
 
 /** Не удаляем созданное вами, если на него уже ссылается чужое: задачи, ноды внутри, стрелки. */
 function keepUsedRecords(
-  nodes: Draft<NodeId, GraphNode>,
-  tasks: Draft<TaskId, Task>,
-  edges: Draft<GraphEdge['id'], GraphEdge>,
-  removedNodes: readonly NodeId[],
-  removedTasks: readonly TaskId[],
+  draft: GraphDraft,
+  removedNodes: readonly GraphNode[],
+  removedTasks: readonly Task[],
   skipped: RevertSkip[],
 ): void {
+  const used = (id: NodeId): boolean =>
+    draft.childrenOf(id).size > 0 ||
+    draft.tasksIn(id).size > 0 ||
+    draft.edgesInto(id).size > 0 ||
+    draft.edgesOut(id).size > 0;
   for (;;) {
-    const usedNodes = new Set<NodeId>();
-    const usedTasks = new Set<TaskId>();
-    for (const node of nodes.values()) if (node.parentId !== null) usedNodes.add(node.parentId);
-    for (const task of tasks.values()) usedNodes.add(task.blockId);
-    for (const edge of edges.values()) {
-      usedNodes.add(edge.target.nodeId);
-      if (edge.source.kind === 'node') usedNodes.add(edge.source.nodeId);
-      else usedTasks.add(edge.source.taskId);
-    }
-    const keepNodes = removedNodes.filter((id) => nodes.isRemoved(id) && usedNodes.has(id));
-    const keepTasks = removedTasks.filter((id) => tasks.isRemoved(id) && usedTasks.has(id));
+    const keepNodes = removedNodes.filter((node) => !draft.node(node.id) && used(node.id));
+    const keepTasks = removedTasks.filter(
+      (task) => !draft.task(task.id) && draft.edgesFromTask(task.id).size > 0,
+    );
     if (keepNodes.length === 0 && keepTasks.length === 0) return;
-    for (const id of keepNodes) {
-      nodes.unremove(id);
-      skipped.push({ record: 'node', id, field: null, reason: 'in_use', by: null });
+    for (const node of keepNodes) {
+      draft.putNode(node);
+      skipped.push({ record: 'node', id: node.id, field: null, reason: 'in_use', by: null });
     }
-    for (const id of keepTasks) {
-      tasks.unremove(id);
-      skipped.push({ record: 'task', id, field: null, reason: 'in_use', by: null });
+    for (const task of keepTasks) {
+      draft.putTask(task);
+      skipped.push({ record: 'task', id: task.id, field: null, reason: 'in_use', by: null });
     }
   }
 }
 
 /**
- * Граф после отмены без последствий (предупреждений и пометок) и что не вернулось.
- * Нужна отдельно для превью: что отмена снова заблокирует.
+ * Отмена в рабочей копии. Последствия (предупреждения и пометки) ставит settle после шага:
+ * предупреждения получают только задачи, изменённые после отменяемого действия, — быстрая
+ * отмена ошибки никого не дёргает. Права на статусы не проверяются — это возврат прежнего
+ * состояния; если граф после отмены нарушил бы инвариант, отмена отклоняется целиком.
  */
-export function revertCandidate(
-  current: Graph,
+export function revertInto(
+  draft: GraphDraft,
   changes: Changes,
-  ctx: ApplyContext,
-): Result<Reverted> {
-  if (ctx.actor.role === 'viewer') {
-    return { ok: false, error: { code: 'FORBIDDEN', reason: 'viewer' } };
-  }
-  const skipped: RevertSkip[] = [];
-  const nodes = draftOf(current.nodes);
-  const tasks = draftOf(current.tasks);
-  const edges = draftOf(current.edges);
-
-  const nodePlan = revertRecords('node', changes.nodes, nodes, skipped);
-  const taskPlan = revertRecords('task', changes.tasks, tasks, skipped);
-  const edgePlan = revertRecords('edge', changes.edges, edges, skipped);
-  keepUsedRecords(nodes, tasks, edges, nodePlan.removed, taskPlan.removed, skipped);
+  skipped: RevertSkip[],
+): GraphError | null {
+  const nodePlan = revertRecords<NodeId, GraphNode>(
+    'node',
+    changes.nodes,
+    {
+      get: (id) => draft.node(id),
+      put: (node) => draft.putNode(node),
+      remove: (id) => draft.removeNode(id),
+      known: knownNode,
+    },
+    skipped,
+  );
+  const taskPlan = revertRecords<TaskId, Task>(
+    'task',
+    changes.tasks,
+    {
+      get: (id) => draft.task(id),
+      put: (task) => draft.putTask(task),
+      remove: (id) => draft.removeTask(id),
+      known: knownTask,
+    },
+    skipped,
+  );
+  const edgePlan = revertRecords<EdgeId, GraphEdge>(
+    'edge',
+    changes.edges,
+    {
+      get: (id) => draft.edge(id),
+      put: (edge) => draft.putEdge(edge),
+      remove: (id) => draft.removeEdge(id),
+      known: knownEdge,
+    },
+    skipped,
+  );
+  keepUsedRecords(draft, nodePlan.removed, taskPlan.removed, skipped);
 
   // Восстановление удалённого: сначала роадмапы, потом ноды внутри них, потом задачи и стрелки.
   const unrestorable = (record: RecordKind, id: string) =>
@@ -274,38 +250,17 @@ export function revertCandidate(
     (a, b) => Number(a.type !== 'roadmap') - Number(b.type !== 'roadmap'),
   );
   for (const node of nodesToRestore) {
-    const parent = node.parentId === null ? null : nodes.get(node.parentId);
+    const parent = node.parentId === null ? undefined : draft.node(node.parentId);
     const placed =
       node.parentId === null || (node.type !== 'roadmap' && parent?.type === 'roadmap');
-    if (placed) nodes.put(node);
+    if (placed) draft.putNode(node);
     else unrestorable('node', node.id);
   }
   for (const task of taskPlan.toRestore) {
-    if (nodes.get(task.blockId)?.type === 'block') tasks.put(task);
+    if (draft.node(task.blockId)?.type === 'block') draft.putTask(task);
     else unrestorable('task', task.id);
   }
-  const graphNow = (): Graph => ({
-    ...current,
-    nodes: nodes.toRecord(),
-    tasks: tasks.toRecord(),
-    edges: edges.toRecord(),
-  });
-  for (const edge of edgePlan.toRestore) {
-    const before = graphNow();
-    const withEdge: Graph = { ...before, edges: putAll(before.edges, [edge]) };
-    if (checkEdge(before, edge) === null && cycleError(withEdge) === null) edges.put(edge);
-    else unrestorable('edge', edge.id);
-  }
+  for (const edge of putEdgesIfValid(draft, edgePlan.toRestore)) unrestorable('edge', edge.id);
 
-  const graph = graphNow();
-  if (
-    graph.nodes === current.nodes &&
-    graph.tasks === current.tasks &&
-    graph.edges === current.edges
-  ) {
-    return { ok: true, value: { graph: current, skipped } };
-  }
-  const broken = checkGraph(graph);
-  if (broken) return { ok: false, error: broken };
-  return { ok: true, value: { graph, skipped } };
+  return checkStep(draft, draft.peekStep());
 }

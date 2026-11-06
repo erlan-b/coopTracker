@@ -4,17 +4,17 @@ import { describe, expect, it } from 'vitest';
 import { previewRelock } from './apply';
 import { changesBetween, combineChanges, isEmptyChanges } from './changes';
 import { asLabelId, asUserId } from './ids';
-import { planRevert } from './revert';
 import {
   E,
   N,
   T,
   apply,
+  applyFull,
   applyOk,
+  applyOpsOk,
   block,
   build,
   ctx,
-  deepFreeze,
   edge,
   milestone,
   roadmap,
@@ -22,6 +22,7 @@ import {
   task,
   taskEdge,
 } from './test-helpers';
+import { LIMITS } from './types';
 import type { ApplyContext, Changes, Graph, Op } from './types';
 
 const T1 = '2026-11-05T11:00:00.000Z';
@@ -38,14 +39,15 @@ const master = (now: string) => ctx('master', { statusMode: 'review' }, now);
 
 /** Применяет операцию и запоминает, что она изменила. */
 function act(graph: Graph, op: Op, context: ApplyContext) {
-  const after = applyOk(graph, op, context);
-  return { after, changes: changesBetween(graph, after, context.now) };
+  const result = applyFull(graph, op, context);
+  if (!result.ok) throw new Error(`${op.kind} отклонена: ${JSON.stringify(result.error)}`);
+  return { after: result.value.graph, changes: result.value.changes };
 }
 
 const revert = (changes: Changes): Op => ({ kind: 'revert', changes });
 
 function undo(graph: Graph, changes: Changes, context: ApplyContext) {
-  const result = planRevert(deepFreeze(graph), deepFreeze(changes), context);
+  const result = applyFull(graph, revert(changes), context);
   if (!result.ok) throw new Error(`отмена отклонена: ${JSON.stringify(result.error)}`);
   return result.value;
 }
@@ -135,9 +137,9 @@ describe('операция + отмена = исходный граф', () => {
     const back = applyOk(after, revert(changes), master(T2));
     expect(back).toEqual(before);
     // Нетронутые записи — те же объекты.
-    for (const node of Object.values(before.nodes)) {
+    for (const node of [...before.nodes.values()]) {
       if (!changes.nodes.some((c) => (c.before ?? c.after)?.id === node.id)) {
-        expect(back.nodes[node.id]).toBe(node);
+        expect(back.nodes.get(node.id)).toBe(node);
       }
     }
     // Повтор (отмена отмены) возвращает граф после операции.
@@ -149,9 +151,9 @@ describe('операция + отмена = исходный граф', () => {
     const deleted = applyOk(base, { kind: 'deleteNode', id: N('a') }, master(T1));
     const op: Op = {
       kind: 'restore',
-      nodes: [base.nodes[N('a')]!],
-      tasks: [base.tasks[T('a1')]!, base.tasks[T('a2')]!],
-      edges: [base.edges[E('ab')]!, base.edges[E('a1m')]!],
+      nodes: [base.nodes.get(N('a'))!],
+      tasks: [base.tasks.get(T('a1'))!, base.tasks.get(T('a2'))!],
+      edges: [base.edges.get(E('ab'))!, base.edges.get(E('a1m'))!],
     };
     const { after, changes } = act(deleted, op, master(T2));
     expect(applyOk(after, revert(changes), master(T3))).toEqual(deleted);
@@ -196,7 +198,7 @@ describe('чужая работа не затирается', () => {
     const mine = act(base, rename('a', 'Моё'), as('ann', T1));
     const theirs = applyOk(mine.after, rename('a', 'Чужое'), as('bob', T2));
     const { graph, skipped } = undo(theirs, mine.changes, as('ann', T3));
-    expect(graph.nodes[N('a')]?.title).toBe('Чужое');
+    expect(graph.nodes.get(N('a'))?.title).toBe('Чужое');
     expect(skipped).toEqual([
       { record: 'node', id: 'a', field: 'title', reason: 'changed', by: 'bob' },
     ]);
@@ -210,7 +212,7 @@ describe('чужая работа не затирается', () => {
       as('bob', T2),
     );
     const { graph, skipped } = undo(theirs, mine.changes, as('ann', T3));
-    expect(graph.nodes[N('a')]).toMatchObject({
+    expect(graph.nodes.get(N('a'))).toMatchObject({
       title: 'A',
       description: 'чужое описание',
       updatedBy: 'bob',
@@ -223,7 +225,7 @@ describe('чужая работа не затирается', () => {
     const mine = act(base, move(100), as('ann', T1));
     const theirs = applyOk(mine.after, move(200), as('bob', T2));
     const { graph, skipped } = undo(theirs, mine.changes, as('ann', T3));
-    expect(graph.nodes[N('a')]?.x).toBe(200);
+    expect(graph.nodes.get(N('a'))?.x).toBe(200);
     expect(skipped.map((s) => s.field)).toEqual(['x']);
   });
 
@@ -236,7 +238,7 @@ describe('чужая работа не затирается', () => {
     const mine = act(base, labels('mine'), as('ann', T1));
     const theirs = applyOk(mine.after, labels('mine', 'theirs'), as('bob', T2));
     const { graph, skipped } = undo(theirs, mine.changes, as('ann', T3));
-    expect(graph.nodes[N('a')]).toHaveProperty('labelIds', ['theirs']);
+    expect(graph.nodes.get(N('a'))).toHaveProperty('labelIds', ['theirs']);
     expect(skipped).toEqual([]);
   });
 
@@ -244,7 +246,7 @@ describe('чужая работа не затирается', () => {
     const mine = act(base, block('c'), as('ann', T1));
     const theirs = applyOk(mine.after, rename('c', 'Чужое'), as('bob', T2));
     const { graph, skipped } = undo(theirs, mine.changes, as('ann', T3));
-    expect(graph.nodes[N('c')]?.title).toBe('Чужое');
+    expect(graph.nodes.get(N('c'))?.title).toBe('Чужое');
     expect(skipped).toEqual([
       { record: 'node', id: 'c', field: null, reason: 'changed', by: 'bob' },
     ]);
@@ -262,8 +264,8 @@ describe('чужая работа не затирается', () => {
     const mine = act(base, { kind: 'deleteTask', id: T('a1') }, as('ann', T1));
     const theirs = applyOk(mine.after, { kind: 'deleteNode', id: N('m') }, as('bob', T2));
     const { graph, skipped } = undo(theirs, mine.changes, as('ann', T3));
-    expect(graph.tasks[T('a1')]).toBe(base.tasks[T('a1')]);
-    expect(graph.edges[E('a1m')]).toBeUndefined();
+    expect(graph.tasks.get(T('a1'))).toBe(base.tasks.get(T('a1')));
+    expect(graph.edges.get(E('a1m'))).toBeUndefined();
     expect(skipped).toEqual([
       { record: 'edge', id: 'a1m', field: null, reason: 'unrestorable', by: null },
     ]);
@@ -322,15 +324,58 @@ describe('предупреждения при отмене', () => {
     const mine = act(graph, setStatus('a1', 'done'), as('ann', T1));
     const theirs = applyOk(mine.after, setStatus('b2', 'in_progress'), as('bob', T2));
     const back = applyOk(theirs, revert(mine.changes), as('ann', T3));
-    expect(back.tasks[T('b2')]?.warnings).toEqual([
+    expect(back.tasks.get(T('b2'))?.warnings).toEqual([
       { source: { kind: 'task', taskId: 'a1' }, at: T3 },
     ]);
-    expect(back.tasks[T('b1')]).toBe(theirs.tasks[T('b1')]);
+    expect(back.tasks.get(T('b1'))).toBe(theirs.tasks.get(T('b1')));
   });
 
   it('previewRelock показывает, что отмена снова заблокирует', () => {
     const mine = act(graph, setStatus('a1', 'done'), as('ann', T1));
     const result = previewRelock(mine.after, revert(mine.changes), as('ann', T2));
     expect(result).toEqual({ ok: true, value: { nodes: ['a'], tasks: ['b1', 'b2'] } });
+  });
+});
+
+describe('отмена принимает только знакомое', () => {
+  it('лишние поля в изменениях не попадают в граф', () => {
+    const deleted = act(base, { kind: 'deleteNode', id: N('m') }, master(T1));
+    const renamed = act(
+      base,
+      { kind: 'updateNode', id: N('a'), patch: { title: 'Моё' } },
+      master(T1),
+    );
+    const tamper = (changes: Changes): Changes => ({
+      ...changes,
+      nodes: changes.nodes.map((c) => ({ ...c, before: c.before && { ...c.before, evil: 1 } })),
+    });
+    const restored = applyOk(deleted.after, revert(tamper(deleted.changes)), master(T2));
+    expect(restored.nodes.get(N('m'))).toEqual(base.nodes.get(N('m')));
+    const merged = applyOk(renamed.after, revert(tamper(renamed.changes)), master(T2));
+    expect(merged.nodes.get(N('a'))).not.toHaveProperty('evil');
+  });
+
+  it(`предупреждений после отмены не больше ${LIMITS.maxWarnings}: уходят самые старые`, () => {
+    const free = (now: string) => ctx('master', {}, now);
+    const sources = Array.from({ length: LIMITS.maxWarnings + 1 }, (_, i) => `s${i}`);
+    let graph = applyOpsOk(build(), [
+      block('src'),
+      block('dst'),
+      task('x', 'dst', { status: 'in_progress' }),
+      ...sources.map((id) => task(id, 'src', { status: 'done' })),
+      ...sources.map((id) => taskEdge(`${id}-dst`, id, 'dst')),
+    ]);
+    graph = applyOk(graph, setStatus('s0', 'todo'), free(T1));
+    const dismissed = act(
+      graph,
+      { kind: 'dismissWarnings', taskId: T('x'), scope: 'this' },
+      free(T1),
+    );
+    graph = dismissed.after;
+    for (const id of sources.slice(1)) graph = applyOk(graph, setStatus(id, 'todo'), free(T2));
+    const back = applyOk(graph, revert(dismissed.changes), free(T3));
+    const warnings = back.tasks.get(T('x'))?.warnings ?? [];
+    expect(warnings).toHaveLength(LIMITS.maxWarnings);
+    expect(warnings.every(({ at }) => at === T2)).toBe(true);
   });
 });

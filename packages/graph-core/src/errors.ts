@@ -37,7 +37,13 @@ export type GraphError =
   /** Например, 'in_review' в envi со statusMode = 'free'. */
   | { readonly code: 'STATUS_NOT_ALLOWED'; readonly status: TaskStatus }
   /** Обратно в блок превращается только пустая роадмапа. */
-  | { readonly code: 'ROADMAP_NOT_EMPTY'; readonly id: NodeId };
+  | { readonly code: 'ROADMAP_NOT_EMPTY'; readonly id: NodeId }
+  /** В ветке уже максимум нод, задач или стрелок, или в пакете слишком много операций (LIMITS). */
+  | {
+      readonly code: 'LIMIT_EXCEEDED';
+      readonly records: 'nodes' | 'tasks' | 'edges' | 'ops';
+      readonly limit: number;
+    };
 
 export type GraphErrorCode = GraphError['code'];
 
@@ -58,6 +64,7 @@ const ERROR_CODE_SET: Record<GraphErrorCode, true> = {
   INVALID_VALUE: true,
   STATUS_NOT_ALLOWED: true,
   ROADMAP_NOT_EMPTY: true,
+  LIMIT_EXCEEDED: true,
 };
 
 /** Все коды ошибок. Интерфейс по нему проверяет, что у каждого кода есть перевод. */

@@ -26,19 +26,19 @@ describe('createEdge', () => {
     const graph = build(block('a'), block('b'), block('c'), task('t', 'a'));
     const withNodeEdge = applyOk(graph, edge('ab', 'a', 'b'));
     const next = applyOk(withNodeEdge, taskEdge('tc', 't', 'c'));
-    expect(next.edges[E('ab')]).toEqual({
+    expect(next.edges.get(E('ab'))).toEqual({
       id: 'ab',
       source: { kind: 'node', nodeId: 'a' },
       target: { kind: 'node', nodeId: 'b' },
     });
-    expect(next.edges[E('tc')]).toEqual({
+    expect(next.edges.get(E('tc'))).toEqual({
       id: 'tc',
       source: { kind: 'task', taskId: 't' },
       target: { kind: 'node', nodeId: 'c' },
     });
     expect(next.nodes).toBe(graph.nodes);
     expect(next.tasks).toBe(graph.tasks);
-    expect(next.edges[E('ab')]).toBe(withNodeEdge.edges[E('ab')]);
+    expect(next.edges.get(E('ab'))).toBe(withNodeEdge.edges.get(E('ab')));
   });
 
   it('конец не найден → NODE_NOT_FOUND / TASK_NOT_FOUND', () => {
@@ -126,7 +126,7 @@ describe('createEdge', () => {
       taskEdge('t-in2', 't', 'in2'),
       edge('r1-r2', 'r1', 'r2'),
     ].reduce((current, op) => applyOk(current, op), graph);
-    expect(Object.keys(next.edges)).toHaveLength(5);
+    expect([...next.edges.keys()]).toHaveLength(5);
   });
 
   it('тупик: блок внутри R ждёт X, а X ждёт всю R → CYCLE', () => {
@@ -169,8 +169,22 @@ describe('createEdge', () => {
 
   it('milestone: стрелки в него и из него', () => {
     const graph = build(block('a'), milestone('m'), block('b'), edge('am', 'a', 'm'));
-    expect(applyOk(graph, edge('mb', 'm', 'b')).edges[E('mb')]).toBeDefined();
+    expect(applyOk(graph, edge('mb', 'm', 'b')).edges.get(E('mb'))).toBeDefined();
     expect(cycleNodes(errorOf(apply(graph, edge('ma', 'm', 'a'))))).toEqual(['a', 'm']);
+  });
+});
+
+describe('путь цикла в ошибке', () => {
+  it('один и тот же, как бы ни лежали записи в памяти', () => {
+    // Два цикла через d → a: через b и через c. Выбор не зависит от порядка создания.
+    const parts = [
+      [block('a'), block('b'), block('c'), block('d')],
+      [edge('ab', 'a', 'b'), edge('ac', 'a', 'c'), edge('bd', 'b', 'd'), edge('cd', 'c', 'd')],
+    ] as const;
+    const forward = build(...parts[0], ...parts[1]);
+    const backward = build(...[...parts[0]].reverse(), ...[...parts[1]].reverse());
+    const closing = edge('da', 'd', 'a');
+    expect(errorOf(apply(forward, closing))).toEqual(errorOf(apply(backward, closing)));
   });
 });
 
@@ -184,8 +198,8 @@ describe('deleteEdge', () => {
       edge('bc', 'b', 'c'),
     );
     const next = applyOk(graph, { kind: 'deleteEdge', id: E('ab') });
-    expect(Object.keys(next.edges)).toEqual(['bc']);
-    expect(next.edges[E('bc')]).toBe(graph.edges[E('bc')]);
+    expect([...next.edges.keys()]).toEqual(['bc']);
+    expect(next.edges.get(E('bc'))).toBe(graph.edges.get(E('bc')));
     expect(next.nodes).toBe(graph.nodes);
   });
 

@@ -21,7 +21,7 @@ import {
 } from './test-helpers';
 import type { Graph, Op, WarningSource } from './types';
 
-const warningsOf = (graph: Graph, id: string) => graph.tasks[T(id)]?.warnings;
+const warningsOf = (graph: Graph, id: string) => graph.tasks.get(T(id))?.warnings;
 const sourcesOf = (graph: Graph, id: string) =>
   warningsOf(graph, id)?.map(({ source }) =>
     source.kind === 'task' ? `task:${source.taskId}` : `node:${source.nodeId}`,
@@ -47,9 +47,9 @@ describe('предупреждение при выходе задачи из в�
     expect(warningsOf(next, 'b-progress')).toEqual(warning);
     expect(warningsOf(next, 'b-review')).toEqual(warning);
     expect(warningsOf(next, 'b-done')).toEqual(warning);
-    expect(next.tasks[T('b-todo')]).toBe(graph.tasks[T('b-todo')]);
+    expect(next.tasks.get(T('b-todo'))).toBe(graph.tasks.get(T('b-todo')));
     // Статус и авторство задач с предупреждением не меняются.
-    expect(next.tasks[T('b-done')]).toMatchObject({
+    expect(next.tasks.get(T('b-done'))).toMatchObject({
       status: 'done',
       updatedBy: 'master',
       updatedAt: NOW,
@@ -78,7 +78,7 @@ describe('предупреждение при выходе задачи из в�
       edge('ab', 'a', 'b'),
     );
     const next = applyOk(graph, setStatus('t', 'todo'));
-    expect(next.tasks[T('b1')]).toBe(graph.tasks[T('b1')]);
+    expect(next.tasks.get(T('b1'))).toBe(graph.tasks.get(T('b1')));
   });
 
   it('идёт дальше по цепочке нод', () => {
@@ -108,7 +108,7 @@ describe('предупреждение при выходе задачи из в�
     );
     const next = applyOk(graph, setStatus('t', 'todo'));
     expect(warningsOf(next, 'b1')).toHaveLength(1);
-    expect(next.tasks[T('c1')]).toBe(graph.tasks[T('c1')]);
+    expect(next.tasks.get(T('c1'))).toBe(graph.tasks.get(T('c1')));
   });
 
   it('соседние задачи того же блока не получают предупреждение', () => {
@@ -118,7 +118,7 @@ describe('предупреждение при выходе задачи из в�
       task('s', 'a', { status: 'in_progress' }),
     );
     const next = applyOk(graph, setStatus('t', 'todo'));
-    expect(next.tasks[T('s')]).toBe(graph.tasks[T('s')]);
+    expect(next.tasks.get(T('s'))).toBe(graph.tasks.get(T('s')));
   });
 
   it('стрелка в роадмапу — предупреждение получает всё внутри', () => {
@@ -158,7 +158,7 @@ describe('предупреждение при выходе задачи из в�
     const unlocking = applyOk(graph, setStatus('t', 'in_progress'), review('master', true));
     expect(warningsOf(unlocking, 'b1')).toHaveLength(1);
     const notUnlocking = applyOk(graph, setStatus('t', 'in_progress'), review('master', false));
-    expect(notUnlocking.tasks[T('b1')]).toBe(graph.tasks[T('b1')]);
+    expect(notUnlocking.tasks.get(T('b1'))).toBe(graph.tasks.get(T('b1')));
   });
 
   it('done → in_review при reviewUnlocks: задача остаётся выполненной, предупреждений нет', () => {
@@ -170,7 +170,7 @@ describe('предупреждение при выходе задачи из в�
       taskEdge('tb', 't', 'b'),
     );
     const next = applyOk(graph, setStatus('t', 'in_review'), review('master', true));
-    expect(next.tasks[T('b1')]).toBe(graph.tasks[T('b1')]);
+    expect(next.tasks.get(T('b1'))).toBe(graph.tasks.get(T('b1')));
   });
 
   it('правка названия или описания предупреждений не даёт', () => {
@@ -182,7 +182,7 @@ describe('предупреждение при выходе задачи из в�
       taskEdge('tb', 't', 'b'),
     );
     const op: Op = { kind: 'updateTask', id: T('t'), patch: { title: 'Новое', description: '…' } };
-    expect(applyOk(graph, op).tasks[T('b1')]).toBe(graph.tasks[T('b1')]);
+    expect(applyOk(graph, op).tasks.get(T('b1'))).toBe(graph.tasks.get(T('b1')));
   });
 
   it('повторное переоткрытие той же задачи не дублирует предупреждение, а обновляет время', () => {
@@ -232,7 +232,7 @@ describe('dismissWarnings', () => {
   it("'this' снимает все предупреждения только у этой задачи", () => {
     const next = applyOk(graph, dismiss('c1', 'this'), ctx('member'));
     expect(warningsOf(next, 'c1')).toEqual([]);
-    expect(next.tasks[T('b1')]).toBe(graph.tasks[T('b1')]);
+    expect(next.tasks.get(T('b1'))).toBe(graph.tasks.get(T('b1')));
   });
 
   it("'downstream' снимает у неё и у следующих задач, но только от тех же источников", () => {

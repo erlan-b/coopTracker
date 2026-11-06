@@ -24,10 +24,12 @@ import type { ApplyContext, Graph, Op } from './types';
 
 const keep = (op: Op): Op => ({ ...op, keepDone: true });
 const sourcesOf = (graph: Graph, id: string) =>
-  graph.tasks[T(id)]?.warnings.map(({ source }) =>
-    source.kind === 'task' ? `task:${source.taskId}` : `node:${source.nodeId}`,
-  );
-const countedOf = (graph: Graph, id: string) => graph.nodes[N(id)]?.countedDone;
+  graph.tasks
+    .get(T(id))
+    ?.warnings.map(({ source }) =>
+      source.kind === 'task' ? `task:${source.taskId}` : `node:${source.nodeId}`,
+    );
+const countedOf = (graph: Graph, id: string) => graph.nodes.get(N(id))?.countedDone;
 
 /** a (a1 выполнена) → b (b1 в работе, b2 не начата). a выполнен, b доступен. */
 const base = build(
@@ -55,16 +57,16 @@ const withX = [block('x'), task('x1', 'x')].reduce((g, op) => applyOk(g, op), ba
 describe('выполненная нода снова становится невыполненной', () => {
   it('новая невыполненная задача: последующее блокируется, начатое получает предупреждение', () => {
     const next = applyOk(base, task('a2', 'a'), ctx('member', {}, LATER));
-    expect(next.tasks[T('b1')]?.warnings).toEqual([
+    expect(next.tasks.get(T('b1'))?.warnings).toEqual([
       { source: { kind: 'node', nodeId: 'a' }, at: LATER },
     ]);
-    expect(next.tasks[T('b2')]).toBe(base.tasks[T('b2')]);
+    expect(next.tasks.get(T('b2'))).toBe(base.tasks.get(T('b2')));
     expect(countedOf(next, 'a')).toBeNull();
   });
 
   it('новая выполненная задача ничего не блокирует', () => {
     const next = applyOk(base, task('a2', 'a', { status: 'done' }));
-    expect(next.tasks[T('b1')]).toBe(base.tasks[T('b1')]);
+    expect(next.tasks.get(T('b1'))).toBe(base.tasks.get(T('b1')));
   });
 
   it('перенос невыполненной задачи в выполненный блок', () => {
@@ -75,7 +77,7 @@ describe('выполненная нода снова становится нев
   it('стрелка от невыполненного: блокируется то, что после блока, но не его задачи', () => {
     const next = applyOk(withX, edge('xa', 'x', 'a'));
     expect(sourcesOf(next, 'b1')).toEqual(['node:a']);
-    expect(next.tasks[T('a1')]).toBe(withX.tasks[T('a1')]);
+    expect(next.tasks.get(T('a1'))).toBe(withX.tasks.get(T('a1')));
   });
 
   it('новый блок внутри выполненной роадмапы', () => {
@@ -97,7 +99,7 @@ describe('выполненная нода снова становится нев
     const locked = applyOk(withX, edge('xa', 'x', 'a'));
     const next = applyOk(locked, { kind: 'dismissWarnings', taskId: T('b1'), scope: 'this' });
     const added = applyOk(next, task('a2', 'a'));
-    expect(added.tasks[T('b1')]).toBe(next.tasks[T('b1')]);
+    expect(added.tasks.get(T('b1'))).toBe(next.tasks.get(T('b1')));
   });
 });
 
@@ -105,14 +107,14 @@ describe('«не блокировать» (keepDone)', () => {
   it('нода получает «засчитано», последующее не блокируется, предупреждений нет', () => {
     const next = applyOk(base, keep(task('a2', 'a')), ctx('member', {}, LATER));
     expect(countedOf(next, 'a')).toEqual({ by: 'member', at: LATER });
-    expect(next.tasks[T('b1')]).toBe(base.tasks[T('b1')]);
+    expect(next.tasks.get(T('b1'))).toBe(base.tasks.get(T('b1')));
   });
 
   it('пометку получает только первая в цепочке нода', () => {
     const next = applyOk(withRoadmap, keep(task('i2', 'in')));
     expect(countedOf(next, 'in')).not.toBeNull();
     expect(countedOf(next, 'r')).toBeNull();
-    expect(next.tasks[T('y1')]).toBe(withRoadmap.tasks[T('y1')]);
+    expect(next.tasks.get(T('y1'))).toBe(withRoadmap.tasks.get(T('y1')));
   });
 
   it('работает для стрелки, нового блока в роадмапе и удаления последней задачи', () => {
@@ -142,7 +144,7 @@ describe('«не блокировать» (keepDone)', () => {
     const counted = applyOk(base, keep(task('a2', 'a')));
     const op: Op = { kind: 'updateNode', id: N('a'), patch: { countedDone: null } };
     const cleared = applyOk(counted, op, ctx('member', {}, LATER));
-    expect(cleared.nodes[N('a')]).toMatchObject({ countedDone: null, updatedBy: 'member' });
+    expect(cleared.nodes.get(N('a'))).toMatchObject({ countedDone: null, updatedBy: 'member' });
     expect(sourcesOf(cleared, 'b1')).toEqual(['node:a']);
   });
 
@@ -162,7 +164,7 @@ describe('«не блокировать» (keepDone)', () => {
   it('переоткрытие задачи в «засчитанном» блоке не блокирует то, что после блока', () => {
     const counted = applyOk(base, keep(task('a2', 'a')));
     const next = applyOk(counted, setStatus('a1', 'todo'));
-    expect(next.tasks[T('b1')]).toBe(counted.tasks[T('b1')]);
+    expect(next.tasks.get(T('b1'))).toBe(counted.tasks.get(T('b1')));
   });
 });
 
@@ -198,5 +200,55 @@ describe('previewRelock', () => {
       ok: false,
       error: { code: 'FORBIDDEN', reason: 'viewer' },
     });
+  });
+});
+
+describe('«засчитанная» нода посреди цепочки', () => {
+  // a (a1 ✓) → t (t1 ✓, t2 — «засчитано») → u (u1 в работе).
+  const chain = applyOk(
+    build(
+      block('a'),
+      task('a1', 'a', { status: 'done' }),
+      block('t'),
+      task('t1', 't', { status: 'done' }),
+      block('u'),
+      task('u1', 'u', { status: 'in_progress' }),
+      edge('at', 'a', 't'),
+      edge('tu', 't', 'u'),
+    ),
+    keep(task('t2', 't')),
+  );
+
+  it('потеря выше неё не идёт дальше: после неё ничего не блокируется', () => {
+    const next = applyOk(chain, setStatus('a1', 'todo'));
+    expect(sourcesOf(next, 't1')).toEqual(['task:a1']);
+    expect(next.tasks.get(T('u1'))).toBe(chain.tasks.get(T('u1')));
+    expect(previewRelock(chain, setStatus('a1', 'todo'), ctx())).toEqual({
+      ok: true,
+      value: { nodes: ['a'], tasks: ['t1', 't2'] },
+    });
+  });
+
+  it('«убрать у всех последующих» тоже не идёт дальше неё', () => {
+    const warned = applyOk(chain, setStatus('a1', 'todo'));
+    const op: Op = { kind: 'dismissWarnings', taskId: T('t1'), scope: 'downstream' };
+    expect(applyOk(warned, op).tasks.get(T('t2'))).toBe(warned.tasks.get(T('t2')));
+  });
+});
+
+describe('«засчитано» после смены настроек envi', () => {
+  const review = ctx('master', { statusMode: 'review', reviewUnlocks: false });
+  const unlocks = ctx('master', { statusMode: 'review', reviewUnlocks: true });
+  // a выполнен; новая задача «на проверке» с «не блокировать» → a засчитан.
+  const counted = applyOk(
+    build(block('a'), task('a1', 'a', { status: 'done' }), block('z')),
+    keep(task('a2', 'a', { status: 'in_review' })),
+    review,
+  );
+
+  it('включили reviewUnlocks — пометка снимается на первой же операции', () => {
+    expect(countedOf(counted, 'a')).not.toBeNull();
+    const next = applyOk(counted, task('z1', 'z'), unlocks);
+    expect(countedOf(next, 'a')).toBeNull();
   });
 });

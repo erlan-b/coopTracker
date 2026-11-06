@@ -119,11 +119,21 @@ export type GraphEdge = {
   readonly target: EdgeTarget;
 };
 
-/** Состояние графа одной ветки. Обычные объекты, а не Map, чтобы снимок напрямую сериализовался в JSON. */
+/**
+ * Состояние графа одной ветки: записи по id. Map, а не обычные объекты: копия и обход в разы
+ * быстрее, а id вроде `__proto__` — обычные ключи. Для передачи и хранения — GraphSnapshot.
+ */
 export type Graph = {
-  readonly nodes: Readonly<Record<NodeId, GraphNode>>;
-  readonly tasks: Readonly<Record<TaskId, Task>>;
-  readonly edges: Readonly<Record<EdgeId, GraphEdge>>;
+  readonly nodes: ReadonlyMap<NodeId, GraphNode>;
+  readonly tasks: ReadonlyMap<TaskId, Task>;
+  readonly edges: ReadonlyMap<EdgeId, GraphEdge>;
+};
+
+/** Граф для JSON (WebSocket, экспорт, IndexedDB): записи списками. */
+export type GraphSnapshot = {
+  readonly nodes: readonly GraphNode[];
+  readonly tasks: readonly Task[];
+  readonly edges: readonly GraphEdge[];
 };
 
 // ---- Изменения полей ----
@@ -166,6 +176,17 @@ export const LIMITS = {
   descriptionMaxLength: 20_000,
   /** Дробный индекс растёт медленно; лимит защищает от мусорных строк, а не от обычной работы. */
   orderMaxLength: 128,
+  /** Предупреждений у задачи: при переполнении уходит самое старое. */
+  maxWarnings: 20,
+  /**
+   * Размер графа ветки. Защищает сервер от перегрузки; скорость операций проверяется тестом
+   * на графе в два раза меньше (graph.perf.test.ts).
+   */
+  maxNodes: 2_000,
+  maxTasks: 20_000,
+  maxEdges: 10_000,
+  /** Операций в одном пакете (applyOps): одно действие пользователя или импорт списка. */
+  maxOpsPerBatch: 1_000,
 } as const;
 
 // ---- Операции ----
@@ -191,6 +212,7 @@ export type OpOptions = {
    * (новая задача в выполненном блоке, новая стрелка от невыполненного и т. п.), нода получает
    * пометку «засчитано» и для всего после неё остаётся выполненной; предупреждений нет.
    * Без флага последующее блокируется, а начатые задачи там получают предупреждение.
+   * В пакете (applyOps) флаг у одной операции действует на весь пакет.
    */
   readonly keepDone?: boolean;
 };

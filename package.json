@@ -9,16 +9,23 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "npm run test:unit && npm run test:perf",
+    "test:unit": "vitest run --project unit",
+    "test:perf": "vitest run --project perf",
+    "test:watch": "vitest --project unit",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.14.0",
     "fast-check": "^4.10.2",
     "prettier": "^3.9.10",
     "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
     "vitest": "^5.1.0"
   }
 }

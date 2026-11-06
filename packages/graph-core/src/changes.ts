@@ -1,29 +1,52 @@
 // Что изменило действие: каждая затронутая запись «до» и «после» (DESIGN.md, «Undo»).
+// Списки упорядочены по id: одно и то же изменение у сервера и клиента записывается одинаково,
+// и сервер может сравнить отмену со своим логом.
 
-import { getOwn, valuesOf } from './records';
+import type { GraphDraft } from './draft';
 import type { Changes, Graph, RecordChange } from './types';
 import { sameValue } from './values';
 
-function diffRecords<K extends string, V extends { readonly id: K }>(
-  before: Readonly<Record<K, V>>,
-  after: Readonly<Record<K, V>>,
+const byId = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Изменения по списку затронутых id: запись до (undefined — не было) и после. */
+function collect<K extends string, V>(
+  touched: Iterable<readonly [K, V | undefined]>,
+  after: ReadonlyMap<K, V>,
+): RecordChange<V>[] {
+  const result: [K, RecordChange<V>][] = [];
+  for (const [id, was] of touched) {
+    const now = after.get(id);
+    if (was === now || (was !== undefined && now !== undefined && sameValue(was, now))) continue;
+    result.push([id, { before: was ?? null, after: now ?? null }]);
+  }
+  return result.sort(([a], [b]) => byId(a, b)).map(([, change]) => change);
+}
+
+/** Изменения рабочей копии с начала её работы: за O(изменённого), а не всего графа. */
+export function changesOfDraft(draft: GraphDraft, at: string): Changes {
+  const touched = draft.touched();
+  return {
+    at,
+    nodes: collect(touched.nodes, draft.nodes),
+    tasks: collect(touched.tasks, draft.tasks),
+    edges: collect(touched.edges, draft.edges),
+  };
+}
+
+function diffRecords<K extends string, V>(
+  before: ReadonlyMap<K, V>,
+  after: ReadonlyMap<K, V>,
 ): RecordChange<V>[] {
   if (before === after) return [];
-  const result: RecordChange<V>[] = [];
-  for (const old of valuesOf(before)) {
-    const now = getOwn(after, old.id);
-    if (now === undefined) result.push({ before: old, after: null });
-    else if (now !== old && !sameValue(now, old)) result.push({ before: old, after: now });
-  }
-  for (const now of valuesOf(after)) {
-    if (!Object.hasOwn(before, now.id)) result.push({ before: null, after: now });
-  }
-  return result;
+  const touched: [K, V | undefined][] = [...before];
+  for (const id of after.keys()) if (!before.has(id)) touched.push([id, undefined]);
+  return collect(touched, after);
 }
 
 /**
- * Изменения от графа «до» к графу «после». Неизменённые записи — те же объекты (graph-core их не
- * пересоздаёт), поэтому сравнение по ссылке отсекает их сразу.
+ * Изменения от графа «до» к графу «после» — для любых двух графов. Результат операции уже
+ * содержит свои изменения (Applied.changes); эта функция — для остального. Неизменённые записи —
+ * те же объекты, поэтому сравнение по ссылке отсекает их сразу.
  */
 export function changesBetween(before: Graph, after: Graph, at: string): Changes {
   return {
@@ -42,19 +65,22 @@ function combineRecords<V extends { readonly id: string }>(
   first: readonly RecordChange<V>[],
   second: readonly RecordChange<V>[],
 ): RecordChange<V>[] {
-  const byId = new Map<string, { before: V | null; after: V | null }>();
+  const byRecord = new Map<string, { before: V | null; after: V | null }>();
   for (const change of first) {
     const id = idOf(change);
-    if (id !== undefined) byId.set(id, { before: change.before, after: change.after });
+    if (id !== undefined) byRecord.set(id, { before: change.before, after: change.after });
   }
   for (const change of second) {
     const id = idOf(change);
     if (id === undefined) continue;
-    const known = byId.get(id);
+    const known = byRecord.get(id);
     if (known) known.after = change.after;
-    else byId.set(id, { before: change.before, after: change.after });
+    else byRecord.set(id, { before: change.before, after: change.after });
   }
-  return [...byId.values()].filter(({ before, after }) => !sameValue(before, after));
+  return [...byRecord]
+    .filter(([, { before, after }]) => !sameValue(before, after))
+    .sort(([a], [b]) => byId(a, b))
+    .map(([, change]) => change);
 }
 
 /**

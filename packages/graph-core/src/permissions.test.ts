@@ -54,7 +54,7 @@ describe('статусы в режиме free', () => {
   const graph = build(block('a'), task('t', 'a'));
 
   it('member сразу ставит done', () => {
-    expect(applyOk(graph, setStatus('t', 'done'), ctx('member')).tasks[T('t')]?.status).toBe(
+    expect(applyOk(graph, setStatus('t', 'done'), ctx('member')).tasks.get(T('t'))?.status).toBe(
       'done',
     );
   });
@@ -82,7 +82,7 @@ describe('статусы в режиме review', () => {
     task('done', 'a', { status: 'done' }),
   );
   const statusOf = (op: Op, context: typeof member, id: string) =>
-    must(applyOk(graph, op, context).tasks[T(id)]).status;
+    must(applyOk(graph, op, context).tasks.get(T(id))).status;
 
   it('member отправляет на проверку, но не ставит done → FORBIDDEN', () => {
     expect(statusOf(setStatus('todo', 'in_review'), member, 'todo')).toBe('in_review');
@@ -101,7 +101,7 @@ describe('статусы в режиме review', () => {
     expect(statusOf(setStatus('done', 'in_progress'), member, 'done')).toBe('in_progress');
     expect(statusOf(setStatus('review', 'todo'), member, 'review')).toBe('todo');
     const edit: Op = { kind: 'updateTask', id: T('done'), patch: { status: 'done', title: 'X' } };
-    expect(applyOk(graph, edit, member).tasks[T('done')]).toMatchObject({
+    expect(applyOk(graph, edit, member).tasks.get(T('done'))).toMatchObject({
       status: 'done',
       title: 'X',
     });

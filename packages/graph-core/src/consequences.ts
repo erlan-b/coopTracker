@@ -1,15 +1,16 @@
 // Последствия изменения графа: предупреждения «снова не выполнено» и пометки «засчитано».
-// Считаются по разнице графа до и после изменения, поэтому одинаковы для любой операции,
+// Считаются по разнице до и после шага (одной операции), поэтому одинаковы для любой операции,
 // включая отмену. Правила — DESIGN.md, «Предупреждение…» и «Когда выполненное снова не выполнено».
 
-import { doneness } from './doneness';
-import type { Doneness } from './doneness';
+import { donenessBeforeStep, evaluate, seedsOf, settingsKey } from './doneness';
+import type { Evaluation } from './doneness';
+import type { GraphDraft, Step } from './draft';
 import type { NodeId, TaskId } from './ids';
-import { getOwn, putAll, valuesOf } from './records';
 import { isTaskCompleted, WARNED_STATUSES } from './status';
-import { spreadLoss, taskEdgeTargets } from './structure';
+import { orderOf, spreadLoss, taskEdgeTargets } from './structure';
 import type { SpreadStart } from './structure';
-import type { ApplyContext, Graph, GraphNode, GraphSettings, Task, WarningSource } from './types';
+import { LIMITS } from './types';
+import type { ApplyContext, GraphSettings, Task, WarningSource } from './types';
 
 /** Что изменение снова заблокирует — для диалога «блокировать / не блокировать / отмена». */
 export type Relock = {
@@ -23,58 +24,64 @@ export function sourceKey(source: WarningSource): string {
   return source.kind === 'node' ? `node:${source.nodeId}` : `task:${source.taskId}`;
 }
 
-/** Одно предупреждение на источник: повтор заменяет старое и обновляет время. */
+/**
+ * Одно предупреждение на источник: повтор заменяет старое и обновляет время. Самые новые —
+ * в конце; сверх LIMITS.maxWarnings уходят самые старые.
+ */
 export function withWarning(task: Task, source: WarningSource, at: string): Task {
   const key = sourceKey(source);
   const others = task.warnings.filter((warning) => sourceKey(warning.source) !== key);
-  return { ...task, warnings: [...others, { source, at }] };
+  const warnings = [...others, { source, at }];
+  return { ...task, warnings: warnings.slice(-LIMITS.maxWarnings) };
 }
 
-/** Задачи, которые изменение вывело из выполненного состояния. */
-function reopenedTasks(before: Graph, after: Graph, settings: GraphSettings): TaskId[] {
-  if (before.tasks === after.tasks) return [];
+const byId = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Задачи, которые шаг вывел из выполненного состояния, по id. */
+function reopenedTasks(view: GraphDraft, step: Step, settings: GraphSettings): TaskId[] {
   const result: TaskId[] = [];
-  for (const task of valuesOf(after.tasks)) {
-    const was = getOwn(before.tasks, task.id);
+  for (const [id, before] of step.tasks) {
+    const after = view.task(id);
     if (
-      was !== undefined &&
-      was !== task &&
-      isTaskCompleted(was.status, settings) &&
-      !isTaskCompleted(task.status, settings)
+      before !== undefined &&
+      after !== undefined &&
+      isTaskCompleted(before.status, settings) &&
+      !isTaskCompleted(after.status, settings)
     ) {
-      result.push(task.id);
+      result.push(id);
     }
   }
-  return result;
+  return result.sort(byId);
 }
 
 /**
- * Кого затрагивает изменение и от какого источника. Переоткрытая задача — источник и для стрелок
+ * Кого затрагивает шаг и от какого источника. Переоткрытая задача — источник и для стрелок
  * от неё, и для всего после её блока, если блок из-за неё перестал быть выполненным. Остальное —
- * от первой в цепочке ноды, которая перестала быть выполненной.
+ * от первой в цепочке ноды, которая перестала быть выполненной. Порядок стартов однозначен
+ * (задачи по id, ноды в порядке зависимостей), поэтому источник у всех получается один и тот же.
  */
 function lossSpread(
-  before: Graph,
-  after: Graph,
+  view: GraphDraft,
+  step: Step,
   settings: GraphSettings,
-  was: Doneness,
-  now: Doneness,
+  evaluation: Evaluation,
 ): Map<TaskId, WarningSource> {
-  const lost = now.order.filter((id) => was.done.has(id) && !now.done.has(id));
-  const lostSet = new Set(lost);
-  const reopened = reopenedTasks(before, after, settings);
+  const lostSet = new Set(evaluation.lost);
+  const reopened = reopenedTasks(view, step, settings);
   const starts: SpreadStart<WarningSource>[] = [];
   for (const taskId of reopened) {
-    const blockId = getOwn(after.tasks, taskId)?.blockId;
+    const blockId = view.task(taskId)?.blockId;
     starts.push({
       tag: { kind: 'task', taskId },
-      locked: taskEdgeTargets(after, taskId),
+      locked: taskEdgeTargets(view, taskId),
       notDone: blockId !== undefined && lostSet.has(blockId) ? [blockId] : [],
     });
   }
-  for (const id of lost)
+  for (const id of evaluation.lost) {
     starts.push({ tag: { kind: 'node', nodeId: id }, locked: [], notDone: [id] });
-  const reached = spreadLoss(after, starts);
+  }
+  if (starts.length === 0) return new Map();
+  const reached = spreadLoss(view, starts, (id) => evaluation.state.done.has(id));
   for (const id of reopened) reached.delete(id);
   return reached;
 }
@@ -87,45 +94,54 @@ export type SettleOptions = {
 };
 
 /**
- * Достраивает граф после изменения: с «не блокировать» ставит «засчитано» нодам, которые
+ * Завершает шаг (одну операцию): с «не блокировать» ставит «засчитано» нодам, которые
  * перестали быть выполненными; снимает пометку там, где нода снова выполнена по-настоящему;
  * ставит предупреждения начатым и выполненным задачам, которые оказались заблокированы.
+ * Если шаг не мог изменить выполненность (перемещение, текст, «не начата» → «в работе»),
+ * ничего не пересчитывается.
  */
-export function settle(
-  before: Graph,
-  after: Graph,
-  ctx: ApplyContext,
-  options: SettleOptions,
-): Graph {
-  const was = doneness(before, ctx.settings);
-  const now = doneness(after, ctx.settings, options.keepDone ? was.done : undefined);
-
-  const marked: GraphNode[] = [];
-  for (const id of now.toCount) {
-    const node = getOwn(after.nodes, id);
-    if (node) marked.push({ ...node, countedDone: { by: ctx.actor.id, at: ctx.now } });
+export function settle(draft: GraphDraft, ctx: ApplyContext, options: SettleOptions): void {
+  const step = draft.takeStep();
+  const key = settingsKey(ctx.settings);
+  const seeds = seedsOf(draft, step, ctx.settings);
+  if (!seeds) {
+    draft.settled(key, draft.donenessAtStep(key));
+    return;
   }
-  for (const id of now.countedNoLongerNeeded) {
-    const node = getOwn(after.nodes, id);
-    if (node) marked.push({ ...node, countedDone: null });
+  const was = donenessBeforeStep(draft, ctx.settings);
+  const evaluation = evaluate(draft, ctx.settings, orderOf(draft), was, seeds, options.keepDone);
+
+  for (const id of evaluation.toCount) {
+    const node = draft.node(id);
+    if (node) draft.putNode({ ...node, countedDone: { by: ctx.actor.id, at: ctx.now } });
+  }
+  for (const id of evaluation.countedNoLongerNeeded) {
+    const node = draft.node(id);
+    if (node) draft.putNode({ ...node, countedDone: null });
   }
 
   const since = options.warnOnlyChangedAfter;
-  const warned: Task[] = [];
-  for (const [taskId, source] of lossSpread(before, after, ctx.settings, was, now)) {
-    const task = getOwn(after.tasks, taskId);
+  for (const [taskId, source] of lossSpread(draft, step, ctx.settings, evaluation)) {
+    const task = draft.task(taskId);
     if (!task || !WARNED_STATUSES.has(task.status)) continue;
     if (since !== null && !(task.updatedAt > since)) continue;
-    warned.push(withWarning(task, source, ctx.now));
+    draft.putTask(withWarning(task, source, ctx.now));
   }
 
-  if (marked.length === 0 && warned.length === 0) return after;
-  return { ...after, nodes: putAll(after.nodes, marked), tasks: putAll(after.tasks, warned) };
+  // Пометки и предупреждения выполненность не меняют: она уже посчитана с их учётом.
+  draft.takeStep();
+  draft.settled(key, evaluation.state);
 }
 
-/** Что изменение заблокирует, без самих предупреждений и пометок. */
-export function relockOf(before: Graph, after: Graph, settings: GraphSettings): Relock {
-  const was = doneness(before, settings);
-  const reached = lossSpread(before, after, settings, was, doneness(after, settings));
-  return { nodes: doneness(after, settings, was.done).toCount, tasks: [...reached.keys()] };
+/** Что шаг заблокирует, без самих предупреждений и пометок. Шаг не завершается. */
+export function relockOf(draft: GraphDraft, settings: GraphSettings): Relock {
+  const step = draft.peekStep();
+  const seeds = seedsOf(draft, step, settings);
+  if (!seeds) return { nodes: [], tasks: [] };
+  const was = donenessBeforeStep(draft, settings);
+  const order = orderOf(draft);
+  const blocking = evaluate(draft, settings, order, was, seeds, false);
+  const reached = lossSpread(draft, step, settings, blocking);
+  const keeping = evaluate(draft, settings, order, was, seeds, true);
+  return { nodes: [...keeping.toCount].sort(byId), tasks: [...reached.keys()].sort(byId) };
 }

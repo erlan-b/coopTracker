@@ -25,7 +25,7 @@ describe('createTask', () => {
   it('создаёт задачу без номера и предупреждений, с авторством', () => {
     const graph = build(block('a'));
     const next = applyOk(graph, task('t', 'a', { status: 'in_progress' }), ctx('member'));
-    expect(next.tasks[T('t')]).toEqual({
+    expect(next.tasks.get(T('t'))).toEqual({
       id: 't',
       blockId: 'a',
       order: 'a0',
@@ -99,7 +99,7 @@ describe('createTask', () => {
         createdBy: 'someone-else',
       },
     } as unknown as Op;
-    expect(applyOk(graph, op).tasks[T('t')]).toMatchObject({
+    expect(applyOk(graph, op).tasks.get(T('t'))).toMatchObject({
       number: null,
       warnings: [],
       createdBy: 'master',
@@ -121,14 +121,14 @@ describe('updateTask', () => {
       { kind: 'updateTask', id: T('t1'), patch },
       ctx('member', {}, LATER),
     );
-    expect(next.tasks[T('t1')]).toMatchObject({
+    expect(next.tasks.get(T('t1'))).toMatchObject({
       ...patch,
       createdBy: 'master',
       createdAt: NOW,
       updatedBy: 'member',
       updatedAt: LATER,
     });
-    expect(next.tasks[T('t2')]).toBe(graph.tasks[T('t2')]);
+    expect(next.tasks.get(T('t2'))).toBe(graph.tasks.get(T('t2')));
     expect(next.nodes).toBe(graph.nodes);
     expect(next.edges).toBe(graph.edges);
   });
@@ -148,7 +148,7 @@ describe('updateTask', () => {
     const graph = build(block('a'), block('b'), task('t', 'a'));
     const patch = { title: 'X', blockId: 'b', number: 5, warnings: [] } as unknown as TaskPatch;
     const next = applyOk(graph, { kind: 'updateTask', id: T('t'), patch });
-    expect(next.tasks[T('t')]).toMatchObject({ title: 'X', blockId: 'a', number: null });
+    expect(next.tasks.get(T('t'))).toMatchObject({ title: 'X', blockId: 'a', number: null });
   });
 });
 
@@ -163,7 +163,7 @@ describe('moveTask', () => {
   it('меняет порядок внутри блока, авторство не трогает', () => {
     const graph = build(block('a'), task('t', 'a', { order: 'a0' }));
     const next = applyOk(graph, move('t', 'a', 'a5'), ctx('member', {}, LATER));
-    expect(next.tasks[T('t')]).toMatchObject({ order: 'a5', updatedAt: NOW });
+    expect(next.tasks.get(T('t'))).toMatchObject({ order: 'a5', updatedAt: NOW });
   });
 
   it('переносит в другой блок, в том числе на другой уровень, с полями и стрелками', () => {
@@ -176,8 +176,8 @@ describe('moveTask', () => {
       taskEdge('tc', 't', 'c'),
     );
     const next = applyOk(graph, move('t', 'in', 'b0'));
-    expect(next.tasks[T('t')]).toEqual({
-      ...must(graph.tasks[T('t')]),
+    expect(next.tasks.get(T('t'))).toEqual({
+      ...must(graph.tasks.get(T('t'))),
       blockId: 'in',
       order: 'b0',
     });
@@ -238,10 +238,10 @@ describe('deleteTask', () => {
       edge('ab', 'a', 'b'),
     );
     const next = applyOk(graph, { kind: 'deleteTask', id: T('t1') });
-    expect(Object.keys(next.tasks)).toEqual(['t2']);
-    expect(Object.keys(next.edges).sort()).toEqual(['ab', 't2b']);
+    expect([...next.tasks.keys()]).toEqual(['t2']);
+    expect([...next.edges.keys()].sort()).toEqual(['ab', 't2b']);
     expect(next.nodes).toBe(graph.nodes);
-    expect(next.tasks[T('t2')]).toBe(graph.tasks[T('t2')]);
+    expect(next.tasks.get(T('t2'))).toBe(graph.tasks.get(T('t2')));
   });
 
   it('задача не найдена → TASK_NOT_FOUND', () => {

@@ -1,12 +1,13 @@
 // Выполненность нод (DESIGN.md, «Вычисляемые состояния»): основа для стрелок и «засчитано».
 
 import { describe, expect, it } from 'vitest';
-import { doneness } from './doneness';
+import { donenessOf } from './doneness';
+import { viewOf } from './draft';
+import { dependencyOrder } from './structure';
 import {
   applyOk,
   block,
   build,
-  ctx,
   edge,
   milestone,
   roadmap,
@@ -18,8 +19,12 @@ import type { Graph, GraphSettings } from './types';
 
 const FREE: GraphSettings = { statusMode: 'free', reviewUnlocks: false };
 const doneIds = (graph: Graph, settings: GraphSettings = FREE) =>
-  [...doneness(graph, settings).done].sort();
-const lockedIds = (graph: Graph) => [...doneness(graph, FREE).locked].sort();
+  [...donenessOf(graph, settings).done].sort();
+const lockedIds = (graph: Graph) => [...donenessOf(graph, FREE).locked].sort();
+const exitOrder = (graph: Graph) =>
+  dependencyOrder(viewOf(graph))
+    .steps.filter(({ step }) => step === 'exit')
+    .map(({ id }) => id);
 
 describe('doneness', () => {
   it('блок выполнен, когда в нём есть задачи и все выполнены; пустой — не выполнен', () => {
@@ -124,6 +129,18 @@ describe('doneness', () => {
       edge('ab', 'a', 'b'),
       edge('bc', 'b', 'c'),
     );
-    expect(doneness(graph, ctx().settings).order).toEqual(['a', 'b', 'c']);
+    expect(exitOrder(graph)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('порядок однозначен: независимые ноды — по id, как бы их ни создавали', () => {
+    const ops = [block('c'), block('a'), roadmap('r'), block('b'), block('in', { parent: 'r' })];
+    expect(exitOrder(build(...ops))).toEqual(['a', 'b', 'c', 'in', 'r']);
+    expect(exitOrder(build(...[...ops].reverse().slice(1), ops[4]!))).toEqual([
+      'a',
+      'b',
+      'c',
+      'in',
+      'r',
+    ]);
   });
 });

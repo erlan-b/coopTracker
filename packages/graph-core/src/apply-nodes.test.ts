@@ -23,7 +23,7 @@ import type { NodePatch, Op } from './types';
 describe('createNode', () => {
   it('создаёт блок и проставляет авторство', () => {
     const graph = applyOk(EMPTY, block('a', { x: 10, y: -20 }), ctx('member'));
-    expect(graph.nodes[N('a')]).toEqual({
+    expect(graph.nodes.get(N('a'))).toEqual({
       id: 'a',
       type: 'block',
       parentId: null,
@@ -48,8 +48,8 @@ describe('createNode', () => {
 
   it('кладёт блок и milestone внутрь роадмапы', () => {
     const graph = build(roadmap('r'), block('b', { parent: 'r' }), milestone('m', { parent: 'r' }));
-    expect(graph.nodes[N('b')]?.parentId).toBe('r');
-    expect(graph.nodes[N('m')]?.parentId).toBe('r');
+    expect(graph.nodes.get(N('b'))?.parentId).toBe('r');
+    expect(graph.nodes.get(N('m'))?.parentId).toBe('r');
   });
 
   it('родитель не найден или не роадмапа → INVALID_PARENT', () => {
@@ -102,7 +102,7 @@ describe('createNode', () => {
         countedDone: { by: 'someone-else', at: NOW },
       },
     } as unknown as Op;
-    const node = applyOk(EMPTY, op).nodes[N('m')];
+    const node = applyOk(EMPTY, op).nodes.get(N('m'));
     expect(node).not.toHaveProperty('labelIds');
     expect(node).toHaveProperty('createdBy', 'master');
     expect(node).toHaveProperty('countedDone', null);
@@ -113,7 +113,7 @@ describe('createNode', () => {
     const next = applyOk(graph, block('c'));
     expect(next.tasks).toBe(graph.tasks);
     expect(next.edges).toBe(graph.edges);
-    expect(next.nodes[N('a')]).toBe(graph.nodes[N('a')]);
+    expect(next.nodes.get(N('a'))).toBe(graph.nodes.get(N('a')));
   });
 });
 
@@ -129,7 +129,7 @@ describe('updateNode', () => {
       },
       ctx('member', {}, LATER),
     );
-    expect(next.nodes[N('a')]).toMatchObject({
+    expect(next.nodes.get(N('a'))).toMatchObject({
       title: 'Авторизация',
       deadline: { kind: 'date', date: '2026-12-01' },
       createdBy: 'master',
@@ -146,7 +146,7 @@ describe('updateNode', () => {
       patch: { deadline: { kind: 'date', date: '2026-12-01' } },
     });
     const next = applyOk(graph, { kind: 'updateNode', id: N('a'), patch: { deadline: null } });
-    expect(next.nodes[N('a')]).toHaveProperty('deadline', null);
+    expect(next.nodes.get(N('a'))).toHaveProperty('deadline', null);
   });
 
   it('поле не этого типа ноды → FIELD_NOT_APPLICABLE', () => {
@@ -173,7 +173,7 @@ describe('updateNode', () => {
   it('поля вне изменения (тип, родитель, координаты) не меняются', () => {
     const graph = build(roadmap('r'), block('a'));
     const patch = { title: 'B', type: 'milestone', parentId: 'r', x: 50 } as unknown as NodePatch;
-    const node = applyOk(graph, { kind: 'updateNode', id: N('a'), patch }).nodes[N('a')];
+    const node = applyOk(graph, { kind: 'updateNode', id: N('a'), patch }).nodes.get(N('a'));
     expect(node).toMatchObject({ title: 'B', type: 'block', parentId: null, x: 0 });
   });
 });
@@ -192,14 +192,14 @@ describe('moveNodes', () => {
       },
       ctx('member', {}, LATER),
     );
-    expect(next.nodes[N('a')]).toMatchObject({
+    expect(next.nodes.get(N('a'))).toMatchObject({
       x: 100,
       y: 40,
       updatedBy: 'master',
       updatedAt: NOW,
     });
-    expect(next.nodes[N('b')]).toBe(graph.nodes[N('b')]);
-    expect(next.nodes[N('c')]).toBe(graph.nodes[N('c')]);
+    expect(next.nodes.get(N('b'))).toBe(graph.nodes.get(N('b')));
+    expect(next.nodes.get(N('c'))).toBe(graph.nodes.get(N('c')));
     expect(next.tasks).toBe(graph.tasks);
     expect(next.edges).toBe(graph.edges);
   });
@@ -243,11 +243,11 @@ describe('deleteNode', () => {
       taskEdge('t2c', 't2', 'c'),
     );
     const next = applyOk(graph, { kind: 'deleteNode', id: N('b') });
-    expect(Object.keys(next.nodes).sort()).toEqual(['a', 'c']);
-    expect(Object.keys(next.tasks)).toEqual(['t2']);
-    expect(Object.keys(next.edges)).toEqual(['t2c']);
-    expect(next.nodes[N('a')]).toBe(graph.nodes[N('a')]);
-    expect(next.tasks[T('t2')]).toBe(graph.tasks[T('t2')]);
+    expect([...next.nodes.keys()].sort()).toEqual(['a', 'c']);
+    expect([...next.tasks.keys()]).toEqual(['t2']);
+    expect([...next.edges.keys()]).toEqual(['t2c']);
+    expect(next.nodes.get(N('a'))).toBe(graph.nodes.get(N('a')));
+    expect(next.tasks.get(T('t2'))).toBe(graph.tasks.get(T('t2')));
   });
 
   it('удаляет роадмапу со всем содержимым, включая стрелки через границу', () => {
@@ -263,9 +263,9 @@ describe('deleteNode', () => {
       edge('src-out', 'src', 'out'),
     );
     const next = applyOk(graph, { kind: 'deleteNode', id: N('r') });
-    expect(Object.keys(next.nodes).sort()).toEqual(['out', 'src']);
-    expect(next.tasks).toEqual({});
-    expect(Object.keys(next.edges)).toEqual(['src-out']);
+    expect([...next.nodes.keys()].sort()).toEqual(['out', 'src']);
+    expect(next.tasks.size).toBe(0);
+    expect([...next.edges.keys()]).toEqual(['src-out']);
   });
 
   it('нода не найдена → NODE_NOT_FOUND', () => {
@@ -291,24 +291,27 @@ describe('blockToRoadmap', () => {
 
   it('задачи переезжают во внутренний блок со всеми полями, стрелки остаются как были', () => {
     const next = applyOk(graph, op, ctx('member', {}, LATER));
-    expect(next.nodes[N('a')]).toMatchObject({
+    expect(next.nodes.get(N('a'))).toMatchObject({
       type: 'roadmap',
       title: 'Авторизация',
       parentId: null,
       updatedBy: 'member',
       updatedAt: LATER,
     });
-    expect(next.nodes[N('a-inner')]).toMatchObject({
+    expect(next.nodes.get(N('a-inner'))).toMatchObject({
       type: 'block',
       parentId: 'a',
       title: 'Авторизация',
       description: '',
       createdBy: 'member',
     });
-    expect(next.tasks[T('t1')]).toEqual({ ...must(graph.tasks[T('t1')]), blockId: 'a-inner' });
-    expect(next.tasks[T('t2')]?.blockId).toBe('a-inner');
+    expect(next.tasks.get(T('t1'))).toEqual({
+      ...must(graph.tasks.get(T('t1'))),
+      blockId: 'a-inner',
+    });
+    expect(next.tasks.get(T('t2'))?.blockId).toBe('a-inner');
     expect(next.edges).toBe(graph.edges);
-    expect(next.nodes[N('x')]).toBe(graph.nodes[N('x')]);
+    expect(next.nodes.get(N('x'))).toBe(graph.nodes.get(N('x')));
   });
 
   it('только блок → WRONG_NODE_TYPE', () => {
@@ -337,7 +340,7 @@ describe('roadmapToBlock', () => {
   it('пустая роадмапа становится блоком', () => {
     const graph = build(roadmap('r', { title: 'Релиз' }));
     const next = applyOk(graph, { kind: 'roadmapToBlock', id: N('r') });
-    expect(next.nodes[N('r')]).toMatchObject({ type: 'block', title: 'Релиз' });
+    expect(next.nodes.get(N('r'))).toMatchObject({ type: 'block', title: 'Релиз' });
   });
 
   it('непустая → ROADMAP_NOT_EMPTY', () => {
@@ -365,12 +368,11 @@ describe('id из сообщений', () => {
       id: 'constructor',
     });
     const graph = applyOk(EMPTY, block('__proto__'));
-    expect(Object.getPrototypeOf(graph.nodes)).toBe(Object.prototype);
-    expect(Object.keys(graph.nodes)).toEqual(['__proto__']);
+    expect([...graph.nodes.keys()]).toEqual(['__proto__']);
     const withTask = applyOk(graph, task('t', '__proto__'));
-    expect(withTask.tasks[T('t')]?.blockId).toBe('__proto__');
+    expect(withTask.tasks.get(T('t'))?.blockId).toBe('__proto__');
     const removed = applyOk(withTask, { kind: 'deleteNode', id: N('__proto__') });
-    expect(Object.keys(removed.nodes)).toEqual([]);
-    expect(Object.keys(removed.tasks)).toEqual([]);
+    expect([...removed.nodes.keys()]).toEqual([]);
+    expect([...removed.tasks.keys()]).toEqual([]);
   });
 });

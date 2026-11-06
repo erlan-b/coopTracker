@@ -1,0 +1,42 @@
+# Проверки на каждый push в main и на каждый PR: те же, что перед коммитом локально (npm run check).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Только чтение репозитория: CI ничего не публикует.
+permissions:
+  contents: read
+
+# Новый push в PR отменяет устаревшую проверку; push в main всегда доходит до конца.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Действия закреплены по коммиту, а не по тегу: тег можно перевесить. Обновляет Dependabot.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Подписи и происхождение пакетов из реестра npm: подменённый пакет не пройдёт.
+      - run: npm audit signatures
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run test:unit
+      # Замеры скорости — отдельным шагом, когда остальные тесты уже не нагружают машину.
+      - run: npm run test:perf
+      # Падает только на high и critical: известные moderate в инструментах разработки
+      # не попадают в продукт (см. DESIGN.md, «Безопасность», «Зависимости»).
+      - run: npm audit --audit-level=high

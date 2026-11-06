@@ -1,0 +1,23 @@
+# Раз в неделю — PR с обновлениями npm-зависимостей и действий CI.
+# Новые версии предлагаются не сразу после выхода (cooldown): свежий релиз чаще оказывается
+# сломанным или скомпрометированным, а за неделю такие обычно уже отзывают.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+    groups:
+      # Мелкие обновления инструментов — одним PR; мажорные — каждое отдельным, их читают.
+      dev-tools:
+        dependency-type: development
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

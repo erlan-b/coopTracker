@@ -1,9 +1,11 @@
 // Структура зависимостей: циклы, порядок обхода и то, что идёт «после» задачи или ноды.
+// Обходы идут по указателям рабочей копии (draft.ts) и смотрят только на соседей.
 
+import { rememberOrder } from './draft';
+import type { GraphDraft } from './draft';
 import { asNodeId } from './ids';
 import type { NodeId, TaskId } from './ids';
-import { getOwn, valuesOf } from './records';
-import type { EdgeSource, Graph, GraphNode } from './types';
+import type { GraphEdge, GraphNode } from './types';
 
 // ---- Граф зависимостей ----
 
@@ -22,80 +24,111 @@ const endOf = (node: GraphNode): Vertex =>
   node.type === 'roadmap' ? `e:${node.id}` : `n:${node.id}`;
 const nodeIdOf = (vertex: Vertex): NodeId => asNodeId(vertex.slice(2));
 
-function sourceNode(graph: Graph, source: EdgeSource): GraphNode | undefined {
-  if (source.kind === 'node') return getOwn(graph.nodes, source.nodeId);
-  const task = getOwn(graph.tasks, source.taskId);
-  return task && getOwn(graph.nodes, task.blockId);
-}
-
-function append<K, V>(map: Map<K, V[]>, key: K, value: V): void {
-  const list = map.get(key);
-  if (list) list.push(value);
-  else map.set(key, [value]);
-}
-
-function dependencyGraph(graph: Graph): Map<Vertex, Vertex[]> {
-  const next = new Map<Vertex, Vertex[]>();
-  for (const node of valuesOf(graph.nodes)) {
+/**
+ * Куда ведут зависимости из вершины. sorted — по порядку вершин, а не как лежат в памяти: так
+ * путь цикла в ошибке у сервера и клиента одинаковый. Для проверки «есть ли путь» не нужно.
+ */
+function successors(view: GraphDraft, vertex: Vertex, sorted: boolean): Vertex[] {
+  const id = nodeIdOf(vertex);
+  const node = view.node(id);
+  if (!node) return [];
+  const result: Vertex[] = [];
+  if (vertex.startsWith('s:')) {
     // Пустая роадмапа пропускает зависимость насквозь: X → R → Y — это всё ещё X → Y.
-    if (node.type === 'roadmap') append(next, startOf(node), endOf(node));
-    const parent = node.parentId === null ? undefined : getOwn(graph.nodes, node.parentId);
-    if (parent) {
-      append(next, startOf(parent), startOf(node));
-      append(next, endOf(node), endOf(parent));
+    result.push(endOf(node));
+    for (const childId of view.childrenOf(id)) {
+      const child = view.node(childId);
+      if (child) result.push(startOf(child));
     }
+    return sorted ? result.sort() : result;
   }
-  for (const edge of valuesOf(graph.edges)) {
-    const from = sourceNode(graph, edge.source);
-    const to = getOwn(graph.nodes, edge.target.nodeId);
-    if (from && to) append(next, endOf(from), startOf(to));
+  for (const edgeId of view.edgesOut(id)) {
+    const edge = view.edge(edgeId);
+    const target = edge && view.node(edge.target.nodeId);
+    if (target) result.push(startOf(target));
   }
-  return next;
+  const parent = node.parentId === null ? undefined : view.node(node.parentId);
+  if (parent?.type === 'roadmap') result.push(endOf(parent));
+  return sorted ? result.sort() : result;
 }
+
+function verticesOf(view: GraphDraft): Vertex[] {
+  const vertices: Vertex[] = [];
+  for (const node of view.nodes.values()) {
+    vertices.push(startOf(node));
+    if (node.type === 'roadmap') vertices.push(endOf(node));
+  }
+  return vertices;
+}
+
+/** Ноды пути без повторов (у роадмапы две вершины). */
+const pathNodes = (path: readonly Vertex[]): NodeId[] => [...new Set(path.map(nodeIdOf))];
 
 // ---- Циклы ----
 
 /**
- * Первый найденный цикл или тупик: ноды в порядке обхода, без повторов (для подсветки).
- * null — циклов нет. Обход без рекурсии, чтобы длинная цепочка не переполнила стек.
+ * Обход в глубину из вершин roots. Возвращает путь до первой вершины, для которой stop даёт
+ * true, или null. Без рекурсии, чтобы длинная цепочка не переполнила стек.
  */
-export function findCycle(graph: Graph): NodeId[] | null {
-  const next = dependencyGraph(graph);
+function searchFrom(
+  view: GraphDraft,
+  sorted: boolean,
+  roots: Iterable<Vertex>,
+  stop: (vertex: Vertex, onPath: ReadonlyMap<Vertex, number>) => boolean,
+): { readonly path: Vertex[]; readonly next: Vertex } | null {
   const finished = new Set<Vertex>();
   const depthOnPath = new Map<Vertex, number>();
-
-  for (const root of next.keys()) {
+  for (const root of roots) {
     if (finished.has(root)) continue;
     const path: Vertex[] = [root];
-    const cursor: number[] = [0];
+    const pending: Vertex[][] = [successors(view, root, sorted)];
     depthOnPath.set(root, 0);
-
     while (path.length > 0) {
-      const depth = path.length - 1;
-      const vertex = path[depth]!;
-      const out = next.get(vertex) ?? [];
-      const i = cursor[depth]!;
-      if (i < out.length) {
-        cursor[depth] = i + 1;
-        const to = out[i]!;
-        const cycleStart = depthOnPath.get(to);
-        if (cycleStart !== undefined) {
-          return [...new Set(path.slice(cycleStart).map(nodeIdOf))];
-        }
-        if (!finished.has(to)) {
-          depthOnPath.set(to, path.length);
-          path.push(to);
-          cursor.push(0);
-        }
-      } else {
-        finished.add(vertex);
-        depthOnPath.delete(vertex);
-        path.pop();
-        cursor.pop();
+      const next = pending[pending.length - 1]!.pop();
+      if (next === undefined) {
+        const done = path.pop()!;
+        pending.pop();
+        finished.add(done);
+        depthOnPath.delete(done);
+        continue;
       }
+      if (stop(next, depthOnPath)) return { path, next };
+      if (finished.has(next) || depthOnPath.has(next)) continue;
+      depthOnPath.set(next, path.length);
+      path.push(next);
+      pending.push(successors(view, next, sorted));
     }
   }
   return null;
+}
+
+/**
+ * Первый найденный цикл или тупик во всём графе: ноды в порядке обхода, без повторов (для
+ * подсветки). null — циклов нет. Есть ли цикл, быстрее узнать через hasCycle; одну новую
+ * стрелку проверяет edgeCycle.
+ */
+export function findCycle(view: GraphDraft): NodeId[] | null {
+  const found = searchFrom(view, true, verticesOf(view).sort(), (next, onPath) => onPath.has(next));
+  if (!found) return null;
+  return pathNodes(found.path.slice(found.path.indexOf(found.next)));
+}
+
+/**
+ * Цикл, который замкнёт стрелка (в графе её ещё нет или она уже есть — неважно): путь от цели
+ * стрелки обратно к ноде, из которой она выходит. null — цикла нет.
+ */
+export function edgeCycle(view: GraphDraft, edge: GraphEdge): NodeId[] | null {
+  const fromId = view.sourceNodeId(edge.source);
+  const from = fromId === undefined ? undefined : view.node(fromId);
+  const to = view.node(edge.target.nodeId);
+  if (!from || !to) return null;
+  // Стрелка «вперёд» по известному порядку зависимостей цикла не замкнёт: обход не нужен.
+  if (view.order && isForward(view.order, view, edge)) return null;
+  const goal = endOf(from);
+  const root = startOf(to);
+  if (root === goal) return [from.id];
+  const found = searchFrom(view, false, [root], (next) => next === goal);
+  return found ? pathNodes([...found.path, found.next]) : null;
 }
 
 // ---- Порядок зависимостей ----
@@ -103,38 +136,155 @@ export function findCycle(graph: Graph): NodeId[] | null {
 /** Шаг обхода: 'enter' — вход ноды (у роадмапы — её начало), 'exit' — выход (у роадмапы — конец). */
 export type OrderStep = { readonly step: 'enter' | 'exit'; readonly id: NodeId };
 
+export type DependencyOrder = {
+  readonly steps: readonly OrderStep[];
+  /** Место шага в steps: по нему пересчёт идёт в порядке зависимостей. */
+  readonly enterRank: ReadonlyMap<NodeId, number>;
+  readonly exitRank: ReadonlyMap<NodeId, number>;
+  /** false — в графе цикл: ноды цикла и всё после них в порядок не попали. */
+  readonly complete: boolean;
+};
+
 /**
  * Ноды в порядке зависимостей: вход ноды идёт после выходов всех, кого она ждёт, и после входа
  * её роадмапы; выход роадмапы — после выходов всех нод внутри. У блока и milestone вход и выход —
- * соседние шаги. Граф без циклов (инвариант), поэтому в порядок попадают все ноды.
+ * соседние шаги. Заодно это проверка на циклы: при цикле в порядок попадают не все ноды.
+ *
+ * Порядок однозначен: из готовых вершин первой берётся меньшая по id. Иначе он зависел бы от
+ * порядка записей в памяти, и сервер с клиентом могли бы по-разному выбрать источник
+ * предупреждения.
  */
-export function dependencyOrder(graph: Graph): OrderStep[] {
-  const next = dependencyGraph(graph);
-  const vertices: Vertex[] = [];
-  for (const node of valuesOf(graph.nodes)) {
-    vertices.push(startOf(node));
-    if (node.type === 'roadmap') vertices.push(endOf(node));
-  }
-  const indegree = new Map<Vertex, number>(vertices.map((vertex) => [vertex, 0]));
-  for (const targets of next.values()) {
-    for (const to of targets) indegree.set(to, (indegree.get(to) ?? 0) + 1);
-  }
+export function dependencyOrder(view: GraphDraft): DependencyOrder {
+  // Вершина v — нода nodes[v >> 1]: чётная — начало (у блока и milestone — единственная),
+  // нечётная — конец роадмапы.
+  const nodes = [...view.nodes.values()];
+  const count = nodes.length;
+  const ids = nodes.map((node) => node.id);
+  const indexOf = new Map<NodeId, number>();
+  for (let i = 0; i < count; i++) indexOf.set(ids[i]!, i);
+  const endOf = (i: number): number => (nodes[i]!.type === 'roadmap' ? 2 * i + 1 : 2 * i);
 
-  const queue = vertices.filter((vertex) => indegree.get(vertex) === 0);
-  const steps: OrderStep[] = [];
-  for (let i = 0; i < queue.length; i++) {
-    const vertex = queue[i]!;
-    const id = nodeIdOf(vertex);
-    if (vertex.startsWith('s:')) steps.push({ step: 'enter', id });
-    else if (vertex.startsWith('e:')) steps.push({ step: 'exit', id });
-    else steps.push({ step: 'enter', id }, { step: 'exit', id });
-    for (const to of next.get(vertex) ?? []) {
-      const left = (indegree.get(to) ?? 0) - 1;
-      indegree.set(to, left);
-      if (left === 0) queue.push(to);
+  // Связи парами «откуда, куда», потом — сплошным массивом по вершинам: без массива на вершину.
+  const links: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const node = nodes[i]!;
+    if (node.type === 'roadmap') links.push(2 * i, 2 * i + 1);
+    const parent = node.parentId === null ? undefined : indexOf.get(node.parentId);
+    if (parent !== undefined && nodes[parent]!.type === 'roadmap') {
+      links.push(2 * parent, 2 * i, endOf(i), 2 * parent + 1);
+    }
+    for (const edgeId of view.edgesOut(node.id)) {
+      const target = view.edge(edgeId)?.target.nodeId;
+      const to = target === undefined ? undefined : indexOf.get(target);
+      if (to !== undefined) links.push(endOf(i), 2 * to);
     }
   }
-  return steps;
+  const vertices = 2 * count;
+  const offsets = new Int32Array(vertices + 1);
+  const indegree = new Int32Array(vertices);
+  for (let k = 0; k < links.length; k += 2) {
+    offsets[links[k]! + 1]!++;
+    indegree[links[k + 1]!]!++;
+  }
+  for (let v = 0; v < vertices; v++) offsets[v + 1]! += offsets[v]!;
+  const targets = new Int32Array(links.length / 2);
+  const cursor = offsets.slice(0, vertices);
+  for (let k = 0; k < links.length; k += 2) targets[cursor[links[k]!]!++] = links[k + 1]!;
+
+  const ready = new MinHeap((a, b) => {
+    const idA = ids[a >> 1]!;
+    const idB = ids[b >> 1]!;
+    return idA < idB || (idA === idB && a < b);
+  });
+  for (let i = 0; i < count; i++) {
+    if (indegree[2 * i] === 0) ready.push(2 * i);
+    if (nodes[i]!.type === 'roadmap' && indegree[2 * i + 1] === 0) ready.push(2 * i + 1);
+  }
+  const steps: OrderStep[] = [];
+  const enterRank = new Map<NodeId, number>();
+  const exitRank = new Map<NodeId, number>();
+  for (let vertex = ready.pop(); vertex !== undefined; vertex = ready.pop()) {
+    const i = vertex >> 1;
+    const id = ids[i]!;
+    if (vertex === 2 * i) {
+      enterRank.set(id, steps.length);
+      steps.push({ step: 'enter', id });
+    }
+    if (vertex === endOf(i)) {
+      exitRank.set(id, steps.length);
+      steps.push({ step: 'exit', id });
+    }
+    for (let k = offsets[vertex]!; k < offsets[vertex + 1]!; k++) {
+      const to = targets[k]!;
+      if (--indegree[to]! === 0) ready.push(to);
+    }
+  }
+  return { steps, enterRank, exitRank, complete: steps.length === 2 * count };
+}
+
+/**
+ * Порядок зависимостей текущего состояния копии: запомненный или посчитанный заново. Для копии
+ * без записей он запоминается и для самого графа.
+ */
+export function orderOf(view: GraphDraft): DependencyOrder {
+  if (view.order) return view.order;
+  const order = dependencyOrder(view);
+  view.order = order;
+  if (view.pristine) rememberOrder(view.base, order);
+  return order;
+}
+
+/**
+ * Стрелка идёт «вперёд» по порядку зависимостей: выход её начала стоит раньше входа её конца.
+ * Такая стрелка не замыкает цикл, а порядок остаётся верным и после неё.
+ */
+export function isForward(order: DependencyOrder, view: GraphDraft, edge: GraphEdge): boolean {
+  if (!order.complete) return false;
+  const fromId = view.sourceNodeId(edge.source);
+  const fromRank = fromId === undefined ? undefined : order.exitRank.get(fromId);
+  const toRank = order.enterRank.get(edge.target.nodeId);
+  return fromRank !== undefined && toRank !== undefined && fromRank < toRank;
+}
+
+/** Есть ли в графе цикл или тупик. Путь для подсветки — findCycle. */
+export const hasCycle = (view: GraphDraft): boolean => !orderOf(view).complete;
+
+/** Двоичная куча: первым выходит меньший по less. */
+class MinHeap {
+  private readonly items: number[] = [];
+
+  constructor(private readonly less: (a: number, b: number) => boolean) {}
+
+  push(item: number): void {
+    const { items, less } = this;
+    let i = items.push(item) - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!less(item, items[parent]!)) break;
+      items[i] = items[parent]!;
+      i = parent;
+    }
+    items[i] = item;
+  }
+
+  pop(): number | undefined {
+    const { items, less } = this;
+    const top = items[0];
+    const last = items.pop();
+    if (top === undefined || last === undefined || items.length === 0) return top;
+    let i = 0;
+    for (;;) {
+      const left = 2 * i + 1;
+      if (left >= items.length) break;
+      const right = left + 1;
+      const child = right < items.length && less(items[right]!, items[left]!) ? right : left;
+      if (!less(items[child]!, last)) break;
+      items[i] = items[child]!;
+      i = child;
+    }
+    items[i] = last;
+    return top;
+  }
 }
 
 // ---- Что идёт после ----
@@ -150,7 +300,8 @@ export type SpreadStart<Tag> = {
 };
 
 /**
- * Задачи, которые затрагивает потеря выполненности, с меткой старта, который дошёл до них первым:
+ * Задачи, которые затрагивает потеря выполненности, с меткой старта, который дошёл до них первым
+ * (старты идут в заданном порядке, поэтому результат однозначен):
  * - нода перестала быть выполненной → блокируется всё по стрелкам от неё, а роадмапа, внутри
  *   которой она лежит, тоже перестаёт быть выполненной;
  * - заблокированная нода перестаёт быть выполненной, её задачи затронуты, а у роадмапы
@@ -158,22 +309,15 @@ export type SpreadStart<Tag> = {
  *
  * Стрелки от задач заблокированного блока дальше не ведут: сами эти задачи остаются
  * выполненными, и то, что ждёт только их, не блокируется.
+ *
+ * staysDone — нода осталась выполненной, хотя её задело (пометка «засчитано»): её задачи
+ * затронуты, но дальше неё потеря не идёт.
  */
 export function spreadLoss<Tag>(
-  graph: Graph,
+  view: GraphDraft,
   starts: readonly SpreadStart<Tag>[],
+  staysDone: (id: NodeId) => boolean,
 ): Map<TaskId, Tag> {
-  const fromNode = new Map<NodeId, NodeId[]>();
-  for (const edge of valuesOf(graph.edges)) {
-    if (edge.source.kind === 'node') append(fromNode, edge.source.nodeId, edge.target.nodeId);
-  }
-  const children = new Map<NodeId, NodeId[]>();
-  for (const node of valuesOf(graph.nodes)) {
-    if (node.parentId !== null) append(children, node.parentId, node.id);
-  }
-  const tasksIn = new Map<NodeId, TaskId[]>();
-  for (const task of valuesOf(graph.tasks)) append(tasksIn, task.blockId, task.id);
-
   const locked = new Set<NodeId>();
   const notDone = new Set<NodeId>();
   const reached = new Map<TaskId, Tag>();
@@ -187,15 +331,19 @@ export function spreadLoss<Tag>(
       if (lock) {
         if (locked.has(id)) continue;
         locked.add(id);
-        for (const taskId of tasksIn.get(id) ?? []) reached.set(taskId, start.tag);
-        for (const child of children.get(id) ?? []) queue.push({ lock: true, id: child });
+        for (const taskId of view.tasksIn(id))
+          if (!reached.has(taskId)) reached.set(taskId, start.tag);
+        for (const child of view.childrenOf(id)) queue.push({ lock: true, id: child });
         queue.push({ lock: false, id });
       } else {
-        if (notDone.has(id)) continue;
+        if (notDone.has(id) || staysDone(id)) continue;
         notDone.add(id);
-        for (const target of fromNode.get(id) ?? []) queue.push({ lock: true, id: target });
-        const parentId = getOwn(graph.nodes, id)?.parentId;
-        if (parentId) queue.push({ lock: false, id: parentId });
+        for (const edgeId of view.edgesOut(id)) {
+          const edge = view.edge(edgeId);
+          if (edge?.source.kind === 'node') queue.push({ lock: true, id: edge.target.nodeId });
+        }
+        const parentId = view.node(id)?.parentId;
+        if (parentId !== undefined && parentId !== null) queue.push({ lock: false, id: parentId });
       }
     }
   }
@@ -203,19 +351,25 @@ export function spreadLoss<Tag>(
 }
 
 /** Куда ведут стрелки от выхода задачи. */
-export function taskEdgeTargets(graph: Graph, taskId: TaskId): NodeId[] {
-  return valuesOf(graph.edges)
-    .filter((edge) => edge.source.kind === 'task' && edge.source.taskId === taskId)
-    .map((edge) => edge.target.nodeId);
+export function taskEdgeTargets(view: GraphDraft, taskId: TaskId): NodeId[] {
+  const targets: NodeId[] = [];
+  for (const edgeId of view.edgesFromTask(taskId)) {
+    const edge = view.edge(edgeId);
+    if (edge) targets.push(edge.target.nodeId);
+  }
+  return targets;
 }
 
 /** Задачи после этой задачи: те, что окажутся заблокированы, если она и её блок перестанут быть выполненными. */
-export function downstreamTasks(graph: Graph, taskId: TaskId): TaskId[] {
-  const task = getOwn(graph.tasks, taskId);
+export function downstreamTasks(view: GraphDraft, taskId: TaskId): TaskId[] {
+  const task = view.task(taskId);
   if (!task) return [];
-  const reached = spreadLoss(graph, [
-    { tag: true, locked: taskEdgeTargets(graph, taskId), notDone: [task.blockId] },
-  ]);
+  const counted = (id: NodeId): boolean => view.countedNodes().has(id);
+  const reached = spreadLoss(
+    view,
+    [{ tag: true, locked: taskEdgeTargets(view, taskId), notDone: [task.blockId] }],
+    counted,
+  );
   reached.delete(taskId);
   return [...reached.keys()];
 }
