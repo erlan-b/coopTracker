@@ -86,7 +86,7 @@ describe('состояния задач', () => {
 });
 
 describe('состояния нод', () => {
-  it('блок: заблокирован → выполнен → пусто → в работе → доступен', () => {
+  it('блок: заблокирован → пусто → выполнен → в работе → доступен', () => {
     const graph = build(
       block('started'),
       task('s1', 'started', { status: 'done' }),
@@ -223,6 +223,43 @@ describe('сводка', () => {
       unestimated: 1,
       assigneeIds: ['u1', 'u2'],
     });
+  });
+
+  it('сумма оценок одинакова при любом порядке задач: 0.1 + 0.2 + 0.3 = 0.6', () => {
+    const ops = [
+      block('x'),
+      ...['x1', 'x2', 'x3'].map((id, i) => task(id, 'x', { order: `a${i}` })),
+      ...[0.1, 0.2, 0.3].map((estimate, i): Op => ({
+        kind: 'updateTask',
+        id: T(`x${i + 1}`),
+        patch: { estimate },
+      })),
+    ];
+    const forward = build(...ops);
+    // Тот же граф, но задачи в словаре в обратном порядке: так их сложат в другом порядке.
+    const backward: Graph = { ...forward, tasks: new Map([...forward.tasks].reverse()) };
+    for (const graph of [forward, backward]) {
+      expect(nodeOf(states(graph), 'x').summary).toMatchObject({
+        estimate: 0.6,
+        estimateLeft: 0.6,
+      });
+    }
+  });
+
+  it('у роадмапы тоже: суммы блоков складываются в 0.6 при любом порядке нод', () => {
+    const ops = [
+      roadmap('r'),
+      ...[0.1, 0.2, 0.3].flatMap((estimate, i): Op[] => [
+        block(`r${i}`, { parent: 'r' }),
+        task(`r${i}-t`, `r${i}`),
+        { kind: 'updateTask', id: T(`r${i}-t`), patch: { estimate } },
+      ]),
+    ];
+    const forward = build(...ops);
+    const backward: Graph = { ...forward, nodes: new Map([...forward.nodes].reverse()) };
+    for (const graph of [forward, backward]) {
+      expect(nodeOf(states(graph), 'r').summary).toMatchObject({ estimate: 0.6 });
+    }
   });
 
   it('роадмапа: по всем блокам внутри', () => {

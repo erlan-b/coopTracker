@@ -3,9 +3,9 @@
 import type { EdgeId, NodeId, TaskId } from './ids';
 import type { NodePatchField, NodeType, TaskStatus } from './types';
 
-/** Почему значение поля не подходит. */
+/** Почему значение поля не подходит. too_precise — больше двух знаков после запятой (оценка). */
 export type InvalidReason =
-  'too_long' | 'too_many' | 'duplicate' | 'not_integer' | 'negative' | 'bad_format';
+  'too_long' | 'too_many' | 'duplicate' | 'not_integer' | 'negative' | 'bad_format' | 'too_precise';
 
 export type GraphError =
   /** viewer ничего не меняет; подтвердить «на проверке» → done может только master. */

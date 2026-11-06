@@ -5,6 +5,7 @@
 import type { GraphError, InvalidReason } from './errors';
 import { LIMITS } from './types';
 import type { Deadline, NodePatch, TaskPatch } from './types';
+import { toHundredths } from './values';
 
 export function invalidValue(field: string, reason: InvalidReason): GraphError {
   return { code: 'INVALID_VALUE', field, reason };
@@ -54,10 +55,16 @@ function checkDeadline(deadline: Deadline | null | undefined): GraphError | null
   return valid ? null : invalidValue('deadline', 'bad_format');
 }
 
+/**
+ * Оценка — не больше двух знаков после запятой: тогда сумма, округлённая до сотых, точная при
+ * любом порядке задач (DESIGN.md, «Сводка блока»). Число с двумя знаками — ближайшее к k/100, и
+ * округление его не меняет; у 0.333 меняет.
+ */
 function checkEstimate(estimate: number | null | undefined): GraphError | null {
   if (estimate === undefined || estimate === null) return null;
   if (!Number.isFinite(estimate)) return invalidValue('estimate', 'bad_format');
-  return estimate < 0 ? invalidValue('estimate', 'negative') : null;
+  if (estimate < 0) return invalidValue('estimate', 'negative');
+  return toHundredths(estimate) === estimate ? null : invalidValue('estimate', 'too_precise');
 }
 
 /** Поля ноды: и при создании, и в изменении (пропущенные поля не проверяются). */

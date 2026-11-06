@@ -21,6 +21,7 @@ import type {
   Task,
   TaskStatus,
 } from './types';
+import { toHundredths } from './values';
 
 /** Состояние задачи. «Заблокирована» — только у не начатой задачи в заблокированном блоке. */
 export type TaskState = 'locked' | 'available' | 'in_progress' | 'in_review' | 'done';
@@ -256,7 +257,7 @@ function nodeView(
 }
 
 /**
- * Настоящее состояние ноды: заблокирована → выполнена → пусто → в работе → доступна.
+ * Настоящее состояние ноды: заблокирована → пусто → выполнена → в работе → доступна.
  * «Засчитанная» нода выполнена только тогда, когда выполнена по-настоящему.
  */
 function nodeState(ctx: Context, node: GraphNode, summary: Summary | null): NodeState {
@@ -464,11 +465,13 @@ function summarize(tasks: readonly Task[]): Summary {
     }
     for (const id of task.assigneeIds) assignees.add(id);
   }
+  // Сумма дробных чисел зависит от порядка, а порядок задач у сервера и клиентов может быть
+  // разным. Оценки не точнее сотых, поэтому округлённая до сотых сумма у всех одна.
   return {
     total: tasks.length,
     byStatus,
-    estimate,
-    estimateLeft,
+    estimate: toHundredths(estimate),
+    estimateLeft: toHundredths(estimateLeft),
     unestimated,
     assigneeIds: [...assignees].sort(byId),
   };
@@ -494,8 +497,8 @@ function combine(parts: readonly Summary[]): Summary {
   return {
     total,
     byStatus,
-    estimate,
-    estimateLeft,
+    estimate: toHundredths(estimate),
+    estimateLeft: toHundredths(estimateLeft),
     unestimated,
     assigneeIds: [...assignees].sort(byId),
   };

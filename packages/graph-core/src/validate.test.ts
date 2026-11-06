@@ -99,6 +99,17 @@ describe('оценка', () => {
       invalid('estimate', 'bad_format'),
     );
   });
+
+  it('не больше двух знаков после запятой', () => {
+    for (const ok of [0.25, 0.07, 1.13, 0.1, 0.29, 12345.67]) {
+      expect(errorField(updateTask({ estimate: ok }))).toBe('ok');
+    }
+    for (const tooPrecise of [0.333, 1.005, 0.001]) {
+      expect(errorField(updateTask({ estimate: tooPrecise }))).toEqual(
+        invalid('estimate', 'too_precise'),
+      );
+    }
+  });
 });
 
 describe('ошибка не меняет граф', () => {

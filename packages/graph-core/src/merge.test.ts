@@ -4,7 +4,19 @@
 import { describe, expect, it } from 'vitest';
 import { asLabelId, asUserId } from './ids';
 import type { MergeOptions, MergeSide, Merged } from './merge';
-import { E, N, T, applyOpsOk, block, build, edge, mergeChecked, must, task } from './test-helpers';
+import {
+  E,
+  N,
+  T,
+  applyOpsOk,
+  block,
+  build,
+  edge,
+  mergeChecked,
+  must,
+  task,
+  withTask,
+} from './test-helpers';
 import type { ApplyContext, Graph, GraphNode, NodePatch, Op, Task, TaskPatch } from './types';
 
 const T1 = '2026-11-07T10:00:00.000Z';
@@ -130,6 +142,16 @@ describe('merge: что изменено с одной стороны', () => {
     });
   });
 
+  it('вперемешку при равном времени правки — подпись целевой', () => {
+    const branch = applyOpsOk(BASE, [updateTask('t3', { title: 'X' })], as('ann', T2));
+    const target = onTarget(updateTask('t3', { description: 'D' }));
+    expect(taskOf(mergeOk(BASE, branch, target).graph, 't3')).toMatchObject({
+      title: 'X',
+      description: 'D',
+      updatedBy: 'bob',
+    });
+  });
+
   it('одинаковое изменение с обеих сторон — без конфликта', () => {
     const branch = onBranch(updateTask('t3', { title: 'X', status: 'done' }));
     const target = onTarget(updateTask('t3', { title: 'X', status: 'done' }));
@@ -169,6 +191,18 @@ describe('merge: конфликты полей', () => {
     const fromTarget = mergeOk(BASE, branch, target, choose(KEY, 'target'));
     expect(taskOf(fromTarget.graph, 't3').title).toBe('Y');
     expect(fromTarget.conflicts.map((conflict) => conflict.chosen)).toEqual(['target']);
+  });
+
+  it('подпись — той стороны, чьё содержимое осталось, даже если другую правили позже', () => {
+    const late = applyOpsOk(BASE, [updateTask('t3', { title: 'X' })], as('ann', T3));
+    const unresolved = mergeOk(BASE, late, target);
+    expect(taskOf(unresolved.graph, 't3')).toBe(taskOf(target, 't3'));
+    expect(unresolved.changes.tasks).toEqual([]);
+    const fromBranch = mergeOk(BASE, late, target, choose(KEY, 'branch'));
+    expect(taskOf(fromBranch.graph, 't3')).toBe(taskOf(late, 't3'));
+    // И наоборот: целевую правили позже, а содержимое осталось из ветки.
+    const fromEarlyBranch = mergeOk(BASE, branch, target, choose(KEY, 'branch'));
+    expect(taskOf(fromEarlyBranch.graph, 't3')).toMatchObject({ updatedBy: 'ann', updatedAt: T1 });
   });
 
   it('решение без конфликта не используется', () => {
@@ -261,6 +295,14 @@ describe('merge: списки как множества', () => {
     expect(nodeOf(mergeOk(BASE, b, t).graph, 'b')).toMatchObject({ labelIds: ['l2', 'l1'] });
   });
 
+  it('вместе ровно лимит — без конфликта', () => {
+    const b = onBranch(updateTask('t3', { assigneeIds: users('u1', 'u2', 'u3', 'u4', 'u5') }));
+    const t = onTarget(updateTask('t3', { assigneeIds: users('v1', 'v2', 'v3', 'v4', 'v5') }));
+    const { graph, conflicts } = mergeOk(BASE, b, t);
+    expect(conflicts).toEqual([]);
+    expect(taskOf(graph, 't3').assigneeIds).toHaveLength(10);
+  });
+
   it('вместе больше лимита — конфликт поля', () => {
     const b = onBranch(
       updateTask('t3', { assigneeIds: users('u1', 'u2', 'u3', 'u4', 'u5', 'u6') }),
@@ -284,6 +326,19 @@ describe('merge: предупреждения', () => {
       { source: { kind: 'task', taskId: 't1' }, at: T1 },
       { source: { kind: 'task', taskId: 't4' }, at: T2 },
     ]);
+  });
+
+  it('вместе больше лимита — остаются самые новые', () => {
+    const warnings = (hour: string, prefix: string) =>
+      Array.from({ length: 12 }, (_, i) => ({
+        source: { kind: 'node' as const, nodeId: N(`${prefix}${i}`) },
+        at: `2026-11-07T${hour}:${String(i).padStart(2, '0')}:00.000Z`,
+      }));
+    const b = withTask(BASE, 't3', { warnings: warnings('10', 'x') });
+    const t = withTask(BASE, 't3', { warnings: warnings('11', 'y') });
+    const merged = taskOf(mergeOk(BASE, b, t).graph, 't3').warnings;
+    expect(merged).toHaveLength(20);
+    expect(merged).toEqual([...warnings('10', 'x').slice(4), ...warnings('11', 'y')]);
   });
 
   it('от одного источника остаётся одно — более позднее', () => {

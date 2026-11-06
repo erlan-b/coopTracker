@@ -20,6 +20,7 @@ import type {
   GraphSettings,
   Op,
   RecordChange,
+  Task,
   TaskStatus,
 } from './types';
 
@@ -226,6 +227,16 @@ export function must<V>(value: V | undefined): V {
   return value;
 }
 
+/**
+ * Тот же граф с изменённой задачей — для состояний, которых операциями не добиться быстро
+ * (например, двадцать предупреждений). Граф новый, без запомненного.
+ */
+export function withTask(graph: Graph, id: string, patch: Partial<Task>): Graph {
+  const tasks = new Map(graph.tasks);
+  tasks.set(asTaskId(id), { ...must(graph.tasks.get(asTaskId(id))), ...patch });
+  return { ...graph, tasks };
+}
+
 // ---- Операции ----
 
 type NodeOptions = {
@@ -320,7 +331,10 @@ export function mergeChecked(
   context: ApplyContext,
   options: MergeOptions = {},
 ): Merged {
-  for (const graph of [base, branch, target]) deepFreeze(graph);
+  for (const graph of [base, branch, target]) {
+    deepFreeze(graph);
+    freezeDerived(graph);
+  }
   const result = merge(base, branch, target, context, options);
   if (!result.ok) throw new Error(`слияние отклонено: ${JSON.stringify(result.error)}`);
   const { graph, changes } = result.value;

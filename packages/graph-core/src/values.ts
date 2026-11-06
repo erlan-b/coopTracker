@@ -27,3 +27,6 @@ export function sameValue(a: unknown, b: unknown): boolean {
 export function ownField(object: object, key: string): unknown {
   return Object.hasOwn(object, key) ? (object as Record<string, unknown>)[key] : undefined;
 }
+
+/** Округление до сотых — для оценок и их сумм (DESIGN.md, «Сводка блока»). */
+export const toHundredths = (value: number): number => Math.round(value * 100) / 100;

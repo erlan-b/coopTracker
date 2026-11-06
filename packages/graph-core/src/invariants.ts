@@ -58,12 +58,17 @@ function checkEndpoints(view: GraphDraft, edge: GraphEdge): GraphError | null {
   return fromNodeId === target.nodeId ? { code: 'SELF_LOOP', edgeId: edge.id } : null;
 }
 
-/** Другая стрелка с тем же началом и концом. */
+/**
+ * Другая стрелка с тем же началом и концом. Перебирается меньший из двух списков: стрелки от
+ * того же начала или в тот же конец. Иначе на ноде с тысячами стрелок (у шапки и у её задач)
+ * каждая проверка перебирала бы их все, и пакет или слияние стали бы квадратичными.
+ */
 function twinOf(view: GraphDraft, edge: GraphEdge): GraphEdge | undefined {
   const { source } = edge;
   const sameStart =
     source.kind === 'node' ? view.edgesOut(source.nodeId) : view.edgesFromTask(source.taskId);
-  for (const otherId of sameStart) {
+  const sameEnd = view.edgesInto(edge.target.nodeId);
+  for (const otherId of sameStart.size <= sameEnd.size ? sameStart : sameEnd) {
     if (otherId === edge.id) continue;
     const other = view.edge(otherId);
     if (other && sameSource(other.source, source) && other.target.nodeId === edge.target.nodeId) {

@@ -20,6 +20,7 @@ import {
   roadmap,
   task,
   taskEdge,
+  withTask,
 } from './test-helpers';
 import type { ApplyContext, Graph, Op } from './types';
 
@@ -97,6 +98,28 @@ describe('merge: удалено в целевой ветке', () => {
     expect(has(graph).noNodes('b')).toBe(true);
   });
 
+  it('в ветке задачу только переставили или она получила предупреждение — удалено без конфликта', () => {
+    const target = onTarget(deleteNode('a'));
+    const reordered = onBranch(moveTask('t1', 'a', 'a9'));
+    const warned = withTask(BASE, 't1', {
+      warnings: [{ source: { kind: 'node', nodeId: N('m') }, at: T1 }],
+    });
+    for (const branch of [reordered, warned]) {
+      const { graph, conflicts } = mergeOk(BASE, branch, target);
+      expect(conflicts).toEqual([]);
+      expect(has(graph).noNodes('a') && has(graph).noTasks('t1', 't2')).toBe(true);
+    }
+  });
+
+  it('стрелка ветки от задачи, которую целевая вынесла из удалённого блока, — без конфликта', () => {
+    const target = onTarget(moveTask('t3', 'a', 'a5'), deleteNode('b'));
+    const branch = onBranch(taskEdge('x1', 't3', 'm'));
+    const { graph, conflicts } = mergeOk(BASE, branch, target);
+    expect(conflicts).toEqual([]);
+    expect(must(graph.tasks.get(T('t3'))).blockId).toBe('a');
+    expect(has(graph).noNodes('b') && has(graph).edges('e3', 'x1')).toBe(true);
+  });
+
   it('в ветке изменили задачу внутри — конфликт на блок; по умолчанию удалено', () => {
     const branch = onBranch(rename('t3', 'X'));
     const target = onTarget(deleteNode('b'));
@@ -109,6 +132,8 @@ describe('merge: удалено в целевой ветке', () => {
         id: 'b',
         deletedIn: 'target',
         chosen: null,
+        inside: { nodes: ['b'], tasks: ['t3'] },
+        orphans: [],
       },
     ]);
     expect(has(graph).noNodes('b')).toBe(true);
@@ -175,6 +200,47 @@ describe('merge: удалено в целевой ветке', () => {
     expect(must(graph.tasks.get(T('t1')))).toMatchObject({ blockId: 'c', order: 'a5' });
     expect(has(graph).tasks('t4') && has(graph).edges('e3')).toBe(true);
   });
+
+  it('перенос в удалённый блок даёт конфликт удаления при любом решении о месте задачи', () => {
+    const branch = onBranch(moveTask('t1', 'c', 'a5'));
+    const target = onTarget(moveTask('t1', 'b', 'a5'), deleteNode('c'));
+    for (const side of [undefined, 'branch', 'target'] as const) {
+      const options = side === undefined ? {} : choose('field:blockId:task:t1', side);
+      const { graph, conflicts } = mergeOk(BASE, branch, target, options);
+      expect(conflicts.map((conflict) => conflict.key)).toEqual([
+        'deleted:node:c',
+        'field:blockId:task:t1',
+      ]);
+      expect(must(graph.tasks.get(T('t1'))).blockId).toBe('b');
+    }
+    const both: MergeOptions = {
+      resolutions: new Map([
+        ['deleted:node:c', 'branch'],
+        ['field:blockId:task:t1', 'branch'],
+      ]),
+    };
+    expect(must(mergeOk(BASE, branch, target, both).graph.tasks.get(T('t1'))).blockId).toBe('c');
+  });
+
+  it('задача, которой при удалении негде остаться, названа в конфликте и уходит с удалённым', () => {
+    // Ветка перенесла t1 в c и удалила её прежний блок a; целевая удалила c.
+    const branch = onBranch(moveTask('t1', 'c', 'a5'), deleteNode('a'));
+    const target = onTarget(deleteNode('c'));
+    const unresolved = mergeOk(BASE, branch, target);
+    expect(unresolved.conflicts).toEqual([
+      expect.objectContaining({
+        key: 'deleted:node:c',
+        inside: { nodes: ['c'], tasks: ['t4'] },
+        orphans: ['t1'],
+      }),
+    ]);
+    expect(has(unresolved.graph).noNodes('a', 'c') && has(unresolved.graph).noTasks('t1')).toBe(
+      true,
+    );
+    const kept = mergeOk(BASE, branch, target, choose('deleted:node:c', 'branch'));
+    expect(kept.conflicts).toEqual([expect.objectContaining({ orphans: ['t1'] })]);
+    expect(must(kept.graph.tasks.get(T('t1'))).blockId).toBe('c');
+  });
 });
 
 describe('merge: удалено в ветке', () => {
@@ -207,6 +273,23 @@ describe('merge: удалено в ветке', () => {
     const { graph } = mergeOk(BASE, branch, target, choose('deleted:node:b', 'branch'));
     expect(has(graph).noNodes('b') && has(graph).noTasks('t3', 't8')).toBe(true);
     expect(has(graph).noEdges('e1', 'e2', 'e3')).toBe(true);
+  });
+
+  it('удалённая задача, изменённая в целевой, — конфликт на задачу; по умолчанию остаётся', () => {
+    const branch = onBranch(deleteTask('t3'));
+    const target = onTarget(rename('t3', 'Y'));
+    const unresolved = mergeOk(BASE, branch, target);
+    expect(unresolved.conflicts).toEqual([
+      expect.objectContaining({
+        key: 'deleted:task:t3',
+        deletedIn: 'branch',
+        inside: { nodes: [], tasks: ['t3'] },
+        orphans: [],
+      }),
+    ]);
+    expect(unresolved.graph).toBe(target);
+    const { graph } = mergeOk(BASE, branch, target, choose('deleted:task:t3', 'branch'));
+    expect(has(graph).noTasks('t3') && has(graph).noEdges('e3')).toBe(true);
   });
 
   it('новая стрелка в целевой к удалённой ноде — конфликт', () => {
@@ -271,6 +354,39 @@ describe('merge: блок ↔ роадмапа против содержимог
     }
   });
 
+  it('из новых блоков внутри роадмапы берётся самый ранний', () => {
+    const converted = applyOpsOk(BASE, [toRoadmap], as('ann', T1));
+    const later = as('ann', '2026-11-07T10:30:00.000Z');
+    const branch = applyOpsOk(converted, [block('a0', { parent: 'b' })], later);
+    const target = onTarget(task('t8', 'b', { order: 'a5' }));
+    const { graph, conflicts } = mergeOk(BASE, branch, target);
+    expect(conflicts).toEqual([]);
+    expect(must(graph.tasks.get(T('t8'))).blockId).toBe('bi');
+  });
+
+  it('блок стал роадмапой с обеих сторон — внутренний блок целевой, содержимое ветки в нём', () => {
+    const branch = onBranch(
+      toRoadmap,
+      task('t9', 'bi', { order: 'a5' }),
+      edge('x1', 'bi', 'm'),
+      taskEdge('x2', 't1', 'bi'),
+    );
+    const target = onTarget({ kind: 'blockToRoadmap', id: N('b'), innerBlockId: N('bj') });
+    const { graph, conflicts } = mergeOk(BASE, branch, target);
+    expect(conflicts).toEqual([]);
+    expect(has(graph).nodes('bj') && has(graph).noNodes('bi')).toBe(true);
+    expect(must(graph.tasks.get(T('t3'))).blockId).toBe('bj');
+    expect(must(graph.tasks.get(T('t9'))).blockId).toBe('bj');
+    expect(must(graph.edges.get(E('x1')))).toMatchObject({
+      source: { kind: 'node', nodeId: 'bj' },
+      target: { kind: 'node', nodeId: 'm' },
+    });
+    expect(must(graph.edges.get(E('x2')))).toMatchObject({
+      source: { kind: 'task', taskId: 't1' },
+      target: { kind: 'node', nodeId: 'bj' },
+    });
+  });
+
   it('внутреннего блока нет — конфликт типа; выбранный тип остаётся', () => {
     const branch = onBranch(toRoadmap, deleteNode('bi'));
     const target = onTarget(task('t8', 'b', { order: 'a5' }));
@@ -298,7 +414,8 @@ describe('merge: блок ↔ роадмапа против содержимог
     const target = onTarget(block('qa', { parent: 'q' }), task('t10', 'qa'));
     const unresolved = mergeOk(BASE, branch, target);
     expect(unresolved.conflicts.map((conflict) => conflict.key)).toEqual(['type:node:q']);
-    expect(must(unresolved.graph.nodes.get(N('q'))).type).toBe('roadmap');
+    // Тип остался целевым — и нода целевая целиком, с подписью: в ней ничего не поменялось.
+    expect(must(unresolved.graph.nodes.get(N('q')))).toBe(must(target.nodes.get(N('q'))));
     expect(has(unresolved.graph).nodes('qa') && has(unresolved.graph).tasks('t10')).toBe(true);
     expect(has(unresolved.graph).noTasks('t9')).toBe(true);
     const { graph } = mergeOk(BASE, branch, target, choose('type:node:q', 'branch'));
@@ -317,6 +434,16 @@ describe('merge: конфликты разных видов вместе', () =>
       'deleted:node:m',
       'field:title:task:t4',
     ]);
+  });
+});
+
+describe('merge: повторный id', () => {
+  it('одна запись — milestone с одной стороны и блок с другой — ошибка DUPLICATE_ID', () => {
+    const branch = onBranch(milestone('z'));
+    const target = onTarget(block('z'));
+    const error = { ok: false, error: { code: 'DUPLICATE_ID', id: 'z' } };
+    expect(merge(BASE, branch, target, as('merger', T3))).toEqual(error);
+    expect(merge(BASE, target, branch, as('merger', T3))).toEqual(error);
   });
 });
 

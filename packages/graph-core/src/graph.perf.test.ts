@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { applyOp, applyOps, previewRelock } from './apply';
 import type { Result } from './errors';
+import { merge } from './merge';
 import { graphFromSnapshot, toSnapshot } from './snapshot';
 import { graphStates, statesFromScratch } from './states';
 import type { Now } from './states';
@@ -29,6 +30,8 @@ const FREQUENT_MS = 5;
 const HEAVY_MS = 10;
 /** Открыть envi: снимок → граф с проверкой → первая операция. Один раз на загрузку. */
 const LOAD_MS = 30;
+/** Граф на пределе лимитов по нодам и стрелкам (2 000 и 10 000): загрузка и слияние. */
+const AT_LIMITS_MS = 60;
 const REPEATS = 25;
 
 declare const performance: { now(): number };
@@ -195,5 +198,47 @@ describe('скорость на 1 000 нод и 10 000 задач', () => {
     const snapshot = toSnapshot(graph);
     const load = () => ok(applyOp(ok(graphFromSnapshot(snapshot)), reopen, context));
     expect(median(load)).toBeLessThan(LOAD_MS);
+  });
+});
+
+/**
+ * «Звезда» на пределе лимитов: блок hub с 8 000 задач, у каждой стрелка в один из 1 999 блоков;
+ * ветка добавляет 1 999 стрелок от шапки hub. Проверка одинаковых стрелок здесь перебирала все
+ * стрелки hub: слияние шло 2,2 с, загрузка — 1,2 с (ревью 2026-11-07). Теперь — как у графа того
+ * же размера с разбросанными стрелками. Бюджет больше обычного: граф вдвое больше по нодам и
+ * впятеро по стрелкам.
+ */
+describe('скорость на ноде с ~10 000 стрелок', () => {
+  const spokes = Array.from({ length: 1_999 }, (_, n) => `s${n}`);
+  const base = buildLarge(
+    [
+      block('hub'),
+      ...spokes.map((id) => block(id)),
+      ...Array.from({ length: 8_000 }, (_, n) => task(`hub-t${n}`, 'hub')),
+      ...Array.from({ length: 8_000 }, (_, n) =>
+        taskEdge(`te${n}`, `hub-t${n}`, spokes[n % spokes.length]!),
+      ),
+    ],
+    context,
+  );
+  let branch = base;
+  for (let n = 0; n < spokes.length; n += 1_000) {
+    const edges = spokes.slice(n, n + 1_000).map((id) => edge(`he-${id}`, 'hub', id));
+    branch = ok(applyOps(branch, edges, context)).graph;
+  }
+
+  it('граф нужного размера', () => {
+    expect([branch.nodes.size, branch.tasks.size, branch.edges.size]).toEqual([
+      2_000, 8_000, 9_999,
+    ]);
+  });
+
+  it(`слияние 1 999 новых стрелок от шапки — до ${AT_LIMITS_MS} мс`, () => {
+    expect(median(() => ok(merge(base, branch, base, context)))).toBeLessThan(AT_LIMITS_MS);
+  });
+
+  it(`загрузка снимка со «звездой» — до ${AT_LIMITS_MS} мс`, () => {
+    const snapshot = toSnapshot(branch);
+    expect(median(() => ok(graphFromSnapshot(snapshot)))).toBeLessThan(AT_LIMITS_MS);
   });
 });
