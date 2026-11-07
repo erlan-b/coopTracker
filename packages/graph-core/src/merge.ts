@@ -5,11 +5,21 @@
 
 import { checkLimits } from './apply';
 import { changesOfDraft } from './changes';
-import { sourceKey } from './consequences';
+import { relockOf, settle, sourceKey } from './consequences';
+import type { Relock } from './consequences';
 import { GraphDraft, viewOf } from './draft';
-import type { Result } from './errors';
+import type { GraphError, Result } from './errors';
 import type { EdgeId, NodeId, TaskId } from './ids';
 import { checkEdge, checkStep } from './invariants';
+import {
+  dependencyOrder,
+  edgeCyclePath,
+  edgeOnCycle,
+  findCycle,
+  hasCycle,
+  isForward,
+} from './structure';
+import type { CyclePath, DependencyOrder } from './structure';
 import { LIMITS } from './types';
 import type {
   ApplyContext,
@@ -87,11 +97,38 @@ export type TypeConflict = Decision & {
   readonly target: NodeType;
 };
 
-export type MergeConflict = FieldConflict | DeletedConflict | TypeConflict;
+/**
+ * Изменение из ветки — новая или возвращённая стрелка или перенос задачи со стрелками —
+ * замкнуло бы цикл и не перенесено: без него задача остаётся там, где в целевой, а стрелки нет.
+ * Целевая ветка сама без циклов, поэтому в любом цикле есть хотя бы одно изменение ветки.
+ *
+ * «Из ветки» — перенести, а цикл разорвать другим изменением ветки на нём: их ключи — в
+ * instead (там решение «из целевой»). Тогда конфликт переезжает на то изменение. Если
+ * перенести нельзя (на цикле нет других изменений ветки или все выбраны «перенести»), выбор не
+ * исполняется и конфликт снова не решён.
+ */
+export type CycleConflict = Decision &
+  (
+    | { readonly record: 'edge'; readonly id: EdgeId }
+    | { readonly record: 'task'; readonly id: TaskId }
+  ) & {
+    readonly kind: 'cycle';
+    /** Ноды цикла по порядку: от цели стрелки до её начала, дальше по стрелке — снова к цели. */
+    readonly cycle: readonly NodeId[];
+    /** Ключи конфликтов других изменений ветки на этом цикле: их можно не переносить вместо. */
+    readonly instead: readonly string[];
+  };
+
+export type MergeConflict = FieldConflict | DeletedConflict | TypeConflict | CycleConflict;
 
 export type MergeOptions = {
   /** Решения конфликтов по ключу. Решение, для которого конфликта нет, не используется. */
   readonly resolutions?: ReadonlyMap<string, MergeSide>;
+  /**
+   * «Не блокировать» на всё слияние: ноды, которые из-за него перестали бы быть выполненными,
+   * получают «засчитано», и предупреждений нет. По умолчанию — блокировать.
+   */
+  readonly keepDone?: boolean;
   /**
    * Ноды, которые двигали с обеих сторон и чья позиция остаётся целевой. Остальные такие ноды
    * получают позицию из ветки. Кому оставить целевую, решает сервер: по правам и по логу
@@ -112,6 +149,11 @@ export type Merged = {
   readonly conflicts: readonly MergeConflict[];
   /** Ноды, которые двигали с обеих сторон, а позиция осталась целевой: «позиции N нод не перенесены». */
   readonly positionsKept: readonly NodeId[];
+  /**
+   * Что слияние снова заблокирует — для «Последующие задачи (N) снова заблокируются»: считается
+   * до последствий и одинаково при любом keepDone.
+   */
+  readonly relock: Relock;
 };
 
 const byId = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -262,7 +304,7 @@ class Decisions {
   }
 
   sorted(): MergeConflict[] {
-    const kinds: readonly MergeConflict['kind'][] = ['deleted', 'type', 'field'];
+    const kinds: readonly MergeConflict['kind'][] = ['deleted', 'type', 'field', 'cycle'];
     const fieldOf = (conflict: MergeConflict) => (conflict.kind === 'field' ? conflict.field : '');
     return this.conflicts.sort(
       (a, b) =>
@@ -629,11 +671,153 @@ function refsOf(units: readonly Unit[]): Refs {
 
 /**
  * Стрелка из ветки, если может встать: концы есть и такой же стрелки ещё нет. Стрелка к тому,
- * что не вернулось, не встаёт — это решение конфликта удаления. Петли и циклы — подшаг 2c.
+ * что не вернулось, не встаёт — это решение конфликта удаления. Петля встаёт: её, как и циклы,
+ * разбирает resolveCycles. Вставшие запоминаются в put.
  */
-function putBranchEdge(draft: GraphDraft, edge: GraphEdge): void {
+function putBranchEdge(draft: GraphDraft, edge: GraphEdge, put: Set<EdgeId>): void {
   const problem = checkEdge(draft, edge);
-  if (problem === null || problem.code === 'SELF_LOOP') draft.putEdge(edge);
+  if (problem !== null && problem.code !== 'SELF_LOOP') return;
+  draft.putEdge(edge);
+  put.add(edge.id);
+}
+
+// ---- Циклы ----
+
+/**
+ * Изменение из ветки, которое может замкнуть цикл: стрелка (новая или возвращённая) или перенос
+ * задачи со стрелками. stay — задача на месте из целевой: так она стоит, если перенос не
+ * переносится.
+ */
+type Change =
+  | { readonly key: string; readonly edge: GraphEdge }
+  | { readonly key: string; readonly moved: Task; readonly stay: Task };
+
+/** Изменения ветки в результате, которые могут замкнуть цикл. */
+function changesFromBranch(
+  draft: GraphDraft,
+  branch: Graph,
+  target: Graph,
+  branchEdges: ReadonlySet<EdgeId>,
+): Change[] {
+  const changes: Change[] = [];
+  for (const id of branchEdges) {
+    const edge = draft.edge(id);
+    if (edge) changes.push({ key: `cycle:edge:${id}`, edge });
+  }
+  for (const id of draft.peekStep().tasks.keys()) {
+    const moved = draft.task(id);
+    const theirs = target.tasks.get(id);
+    if (!moved || !theirs || moved.blockId === theirs.blockId) continue;
+    if (moved.blockId !== branch.tasks.get(id)?.blockId) continue;
+    if (draft.edgesFromTask(id).size === 0) continue;
+    // Перенос, который некуда вернуть (прежний блок удалён), — не кандидат: он остаётся.
+    if (draft.node(theirs.blockId)?.type !== 'block') continue;
+    const back = { ...moved, blockId: theirs.blockId, order: theirs.order };
+    changes.push({ key: `cycle:task:${id}`, moved, stay: sameValue(back, theirs) ? theirs : back });
+  }
+  return changes;
+}
+
+/**
+ * Пробует перенести изменение. Если оно замкнёт цикл — не переносит и возвращает этот цикл.
+ * order — порядок зависимостей, пока он верен: стрелка «вперёд» по нему проверяется без обхода и
+ * порядок не ломает. После стрелки «назад» порядок неверен, и дальше проверяет обход. Обход —
+ * по порядку вершин: путь цикла и «вместо» в конфликте одинаковы у сервера и клиента.
+ */
+function tryCarry(
+  draft: GraphDraft,
+  change: Change,
+  order: { current: DependencyOrder | null },
+): CyclePath | null {
+  const forward = (edge: GraphEdge) =>
+    order.current !== null && isForward(order.current, draft, edge);
+  if ('edge' in change) {
+    if (!forward(change.edge)) {
+      const path = edgeCyclePath(draft, change.edge, true);
+      if (path) return path;
+      order.current = null;
+    }
+    draft.putEdge(change.edge);
+    return null;
+  }
+  draft.putTask(change.moved);
+  let allForward = true;
+  for (const edgeId of [...draft.edgesFromTask(change.moved.id)].sort(byId)) {
+    const edge = draft.edge(edgeId);
+    if (!edge || forward(edge)) continue;
+    allForward = false;
+    const path = edgeCyclePath(draft, edge, true);
+    if (path) {
+      draft.putTask(change.stay);
+      return path;
+    }
+  }
+  if (!allForward) order.current = null;
+  return null;
+}
+
+/** Изменение лежит на цикле: его стрелка или одна из стрелок перенесённой задачи. */
+function onCycle(draft: GraphDraft, path: CyclePath, change: Change): boolean {
+  if ('edge' in change) return edgeOnCycle(draft, path, change.edge);
+  for (const edgeId of draft.edgesFromTask(change.moved.id)) {
+    const edge = draft.edge(edgeId);
+    if (edge && edgeOnCycle(draft, path, edge)) return true;
+  }
+  return false;
+}
+
+/**
+ * Циклы после слияния. Обычно их нет, и ничего не делается. Иначе изменения ветки, которые могут
+ * замкнуть цикл, убираются и переносятся заново по одному: сначала выбранные «из ветки», потом
+ * нерешённые, потом выбранные «из целевой»; внутри — по ключу (стрелки по id, потом переносы).
+ * Изменение, которое замкнуло бы цикл, не переносится — это конфликт цикла. Так по умолчанию не
+ * переносится последнее по порядку изменение каждого цикла, а результат всегда без циклов.
+ */
+function resolveCycles(
+  draft: GraphDraft,
+  branch: Graph,
+  target: Graph,
+  branchEdges: ReadonlySet<EdgeId>,
+  decisions: Decisions,
+): GraphError | null {
+  if (!draft.structureChanged || !hasCycle(draft)) return null;
+  const changes = changesFromBranch(draft, branch, target, branchEdges);
+  for (const change of changes) {
+    if ('edge' in change) draft.removeEdge(change.edge.id);
+    else draft.putTask(change.stay);
+  }
+  // Без изменений ветки цикла быть не может: целевая без циклов. Если всё же есть — ошибка.
+  if (hasCycle(draft)) return { code: 'CYCLE', path: findCycle(draft) ?? [] };
+
+  const rank = (change: Change) => {
+    const chosen = decisions.chosen(change.key);
+    return chosen === 'branch' ? 0 : chosen === null ? 1 : 2;
+  };
+  const queue = [...changes].sort((a, b) => rank(a) - rank(b) || byId(a.key, b.key));
+  const order = { current: dependencyOrder(draft) as DependencyOrder | null };
+  const carried: Change[] = [];
+  for (const change of queue) {
+    const path = tryCarry(draft, change, order);
+    if (path === null) {
+      carried.push(change);
+      continue;
+    }
+    const chosen = decisions.chosen(change.key);
+    const ref: { record: 'edge'; id: EdgeId } | { record: 'task'; id: TaskId } =
+      'edge' in change
+        ? { record: 'edge', id: change.edge.id }
+        : { record: 'task', id: change.moved.id };
+    decisions.add({
+      kind: 'cycle',
+      key: change.key,
+      ...ref,
+      // «Перенести» здесь исполнить нельзя: конфликт снова не решён.
+      chosen: chosen === 'target' ? 'target' : null,
+      cycle: path.nodes,
+      instead: carried.filter((other) => onCycle(draft, path, other)).map((other) => other.key),
+    });
+  }
+  return null;
 }
 
 /**
@@ -888,24 +1072,31 @@ export function merge(
 
   // Стрелки: удалённые в ветке уходят, если не держатся за оставленное; новые в ветке встают;
   // удалённые в целевой возвращаются вместе с возвращённым из ветки.
+  const branchEdges = new Set<EdgeId>();
   for (const [id, edge] of base.edges) {
     const inBranch = branch.edges.get(id);
     const inTarget = target.edges.has(id);
     if (inBranch === undefined && inTarget) {
       if (!touches(edge, notDeleted)) draft.removeEdge(id);
     } else if (inBranch !== undefined && !inTarget && touches(edge, restored)) {
-      putBranchEdge(draft, inBranch);
+      putBranchEdge(draft, inBranch, branchEdges);
     }
   }
   for (const [id, edge] of branch.edges) {
-    if (!base.edges.has(id) && !target.edges.has(id)) putBranchEdge(draft, edge);
+    if (!base.edges.has(id) && !target.edges.has(id)) putBranchEdge(draft, edge, branchEdges);
   }
 
   settleTypes(draft, base, branch, target, decisions);
 
-  const problem = checkLimits(draft) ?? checkStep(draft, draft.peekStep());
+  const problem =
+    resolveCycles(draft, branch, target, branchEdges, decisions) ??
+    checkLimits(draft) ??
+    checkStep(draft, draft.peekStep());
   if (problem) return { ok: false, error: problem };
 
+  // Последствия — как у пакета операций: слияние — одно действие в целевой ветке.
+  const relock = relockOf(draft, ctx.settings);
+  settle(draft, ctx, { keepDone: options.keepDone === true, warnOnlyChangedAfter: null });
   const changes = changesOfDraft(draft, ctx.now);
   return {
     ok: true,
@@ -914,6 +1105,7 @@ export function merge(
       changes,
       conflicts: decisions.sorted(),
       positionsKept: merger.positionsKept.sort(byId),
+      relock,
     },
   };
 }

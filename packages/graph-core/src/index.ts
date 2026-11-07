@@ -11,6 +11,7 @@ export type { GraphStates, NodeState, NodeView, Now, Summary, TaskState, TaskVie
 export type { RevertSkip } from './revert';
 export { merge } from './merge';
 export type {
+  CycleConflict,
   DeletedConflict,
   FieldConflict,
   MergeConflict,

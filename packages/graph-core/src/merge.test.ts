@@ -88,11 +88,12 @@ describe('merge: что изменено с одной стороны', () => {
   });
 
   it('изменено только в ветке — результат как в ветке, записи ветки теми же объектами', () => {
+    // Без изменений выполненности: иначе слияние добавило бы свои предупреждения (последствия).
     const branch = onBranch(
       updateTask('t3', { title: 'X', assigneeIds: users('u1') }),
       updateNode('b', { description: 'описание' }),
       moveNode('c', 40, 80),
-      moveTask('t5', 'a', 'a2'),
+      moveTask('t5', 'b', 'a2'),
       block('d'),
       task('t8', 'd'),
       edge('e3', 'b', 'd'),
@@ -320,7 +321,10 @@ describe('merge: предупреждения', () => {
   const reopen = (id: string): Op => updateTask(id, { status: 'in_progress' });
 
   it('новые с обеих сторон остаются, самые новые в конце', () => {
-    const { graph, conflicts } = mergeOk(BASE, onBranch(reopen('t1')), onTarget(reopen('t4')));
+    // «Не блокировать»: слияние не ставит своих предупреждений, видно только слияние сторон.
+    const { graph, conflicts } = mergeOk(BASE, onBranch(reopen('t1')), onTarget(reopen('t4')), {
+      keepDone: true,
+    });
     expect(conflicts).toEqual([]);
     expect(taskOf(graph, 't3').warnings).toEqual([
       { source: { kind: 'task', taskId: 't1' }, at: T1 },

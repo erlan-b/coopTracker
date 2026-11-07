@@ -113,11 +113,28 @@ export function findCycle(view: GraphDraft): NodeId[] | null {
   return pathNodes(found.path.slice(found.path.indexOf(found.next)));
 }
 
+/** Цикл, который замкнёт стрелка: ноды по порядку и переходы между вершинами. */
+export type CyclePath = {
+  /** От цели стрелки до ноды, из которой она выходит; дальше по самой стрелке — снова к цели. */
+  readonly nodes: NodeId[];
+  /** Переходы «откуда>куда» между вершинами цикла, включая саму стрелку: что лежит на цикле. */
+  readonly hops: ReadonlySet<string>;
+};
+
+/** Переход стрелки между вершинами: от выхода её начала ко входу её цели. */
+function hopOf(view: GraphDraft, edge: GraphEdge): string | undefined {
+  const fromId = view.sourceNodeId(edge.source);
+  const from = fromId === undefined ? undefined : view.node(fromId);
+  const to = view.node(edge.target.nodeId);
+  return from && to ? `${endOf(from)}>${startOf(to)}` : undefined;
+}
+
 /**
  * Цикл, который замкнёт стрелка (в графе её ещё нет или она уже есть — неважно): путь от цели
- * стрелки обратно к ноде, из которой она выходит. null — цикла нет.
+ * стрелки обратно к ноде, из которой она выходит. null — цикла нет. sorted — обход по порядку
+ * вершин: путь одинаковый у сервера и клиента (нужно, когда путь попадает в результат).
  */
-export function edgeCycle(view: GraphDraft, edge: GraphEdge): NodeId[] | null {
+export function edgeCyclePath(view: GraphDraft, edge: GraphEdge, sorted = false): CyclePath | null {
   const fromId = view.sourceNodeId(edge.source);
   const from = fromId === undefined ? undefined : view.node(fromId);
   const to = view.node(edge.target.nodeId);
@@ -126,9 +143,24 @@ export function edgeCycle(view: GraphDraft, edge: GraphEdge): NodeId[] | null {
   if (view.order && isForward(view.order, view, edge)) return null;
   const goal = endOf(from);
   const root = startOf(to);
-  if (root === goal) return [from.id];
-  const found = searchFrom(view, false, [root], (next) => next === goal);
-  return found ? pathNodes([...found.path, found.next]) : null;
+  const hops = new Set([`${goal}>${root}`]);
+  if (root === goal) return { nodes: [from.id], hops };
+  const found = searchFrom(view, sorted, [root], (next) => next === goal);
+  if (!found) return null;
+  const vertices = [...found.path, found.next];
+  for (let i = 1; i < vertices.length; i++) hops.add(`${vertices[i - 1]}>${vertices[i]}`);
+  return { nodes: pathNodes(vertices), hops };
+}
+
+/** Ноды цикла, который замкнёт стрелка; null — цикла нет. */
+export function edgeCycle(view: GraphDraft, edge: GraphEdge): NodeId[] | null {
+  return edgeCyclePath(view, edge)?.nodes ?? null;
+}
+
+/** Стрелка лежит на цикле: её переход между вершинами есть в пути. */
+export function edgeOnCycle(view: GraphDraft, path: CyclePath, edge: GraphEdge): boolean {
+  const hop = hopOf(view, edge);
+  return hop !== undefined && path.hops.has(hop);
 }
 
 // ---- Порядок зависимостей ----
